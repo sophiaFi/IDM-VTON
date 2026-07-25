@@ -93,7 +93,7 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
         target_stem = os.path.splitext(os.path.basename(record["target"]))[0]
         target_ext  = os.path.splitext(os.path.basename(record["target"]))[1]
 
-        mask_out  = os.path.join(out_mask_dir, f"{target_stem}_mask.png")
+        mask_out  = os.path.join(out_mask_dir, f"{target_stem}{target_ext}")
         pose_out  = os.path.join(out_pose_dir, f"{target_stem}{target_ext}")
 
         already_done = os.path.exists(mask_out) and os.path.exists(pose_out)
