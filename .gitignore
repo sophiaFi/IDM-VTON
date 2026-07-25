@@ -1,0 +1,12 @@
+# data
+/data_mini_test
+
+# cache
+__pycache__
+ckpt/
+
+.vscode
+
+# Claude
+CLAUDE.md
+
