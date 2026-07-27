@@ -15,7 +15,7 @@ import numpy as np
 from PIL import Image
 from transformers import CLIPImageProcessor
 
-from measurement_encoder import normalize_measurements
+from src.measurement_encoder import normalize_measurements
 
 
 class FITDatasetWithMeasurements(data.Dataset):
