@@ -5,8 +5,12 @@
 __pycache__
 ckpt/
 
+# local
 .vscode
+Dockerfile.local
 
 # Claude
 CLAUDE.md
 
+# documentation and concept
+docs/
