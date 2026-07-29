@@ -37,7 +37,7 @@ from transformers import (
     CLIPTextModel, CLIPTokenizer,
     CLIPVisionModelWithProjection, CLIPTextModelWithProjection,
 )
-#from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model
 from tqdm.auto import tqdm
 from typing import List
 

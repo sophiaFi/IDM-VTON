@@ -1,0 +1,14 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v1
+      - .
+
+images:
+  - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v1
+
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 50
