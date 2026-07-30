@@ -1,0 +1,102 @@
+# Vertex AI CustomJob spec — passed to --config.
+# The --config flag accepts only the CustomJobSpec fields (workerPoolSpecs,
+# scheduling, …). Top-level job fields like displayName go on the CLI:
+#
+#   gcloud ai custom-jobs create \
+#       --region=<REGION> \
+#       --display-name=idm-vton-profile-run \
+#       --config=vertex_job.yaml
+#
+# After the job finishes, retrieve the profile with:
+#   gsutil cp gs://ma-idm-vton-data/profile_output/resource_profile.json .
+# Or read it directly from Cloud Logging (it is also printed to stdout).
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v1
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          # google-cloud-storage is not in the Dockerfile; install it here
+          # so we can download the dataset and upload results without gsutil.
+          pip install --quiet google-cloud-storage==2.14.0
+
+          # Download dataset and checkpoints from GCS to local disk.
+          # Training code uses open() / PIL.Image.open() and from_pretrained()
+          # with local paths, so gs:// URIs cannot be used directly.
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          bucket_name = "ma-idm-vton-data"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+                  print(f"  downloaded {blob.name}")
+              print(f"Done: {local_root}  ({len(blobs)} files)")
+
+          download_prefix("datasets/fit-mini/", "/tmp/fit-mini")
+          download_prefix("ckpt/image_encoder/", "/tmp/ckpt/image_encoder")
+          download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
+          PYEOF
+
+          # Run the profiling training.
+          # A100 supports bf16; using it instead of fp16 for better numerical stability.
+          accelerate launch \
+            --num_processes=1 \
+            --num_machines=1 \
+            --mixed_precision=bf16 \
+            train_with_measurements.py \
+            --profile_steps 20 \
+            --num_train_epochs 2 \
+            --train_batch_size 1 \
+            --mixed_precision bf16 \
+            --gradient_checkpointing \
+            --data_dir /tmp/fit-mini \
+            --image_encoder_path /tmp/ckpt/image_encoder \
+            --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            --output_dir /tmp/output
+
+          # Upload resource_profile.json to GCS so it survives container exit.
+          # The same JSON is also printed to stdout and visible in Cloud Logging.
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          src = pathlib.Path("/tmp/output/resource_profile.json")
+          if not src.exists():
+              print("WARNING: resource_profile.json not found — profiling may have failed.", file=sys.stderr)
+              sys.exit(0)
+          dest_blob = "profile_output/resource_profile.json"
+          storage.Client().bucket("ma-idm-vton-data").blob(dest_blob).upload_from_filename(str(src))
+          print(f"Uploaded to gs://ma-idm-vton-data/{dest_blob}")
+          PYEOF
+
+
+scheduling:
+  # Use preemptible/spot VMs — required to consume the preemptible A100 quota.
+  # A preemptible job can be interrupted, but for a short profiling run this
+  # is acceptable. The job will not be retried if it is preempted or OOMs.
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
