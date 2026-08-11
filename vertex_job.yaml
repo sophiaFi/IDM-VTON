@@ -18,7 +18,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v1
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
       command:
         - /bin/bash
         - -c
@@ -72,10 +72,15 @@ workerPoolSpecs:
             --train_batch_size 1 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
+            --height 512 \
+            --width 384 \
             --data_dir /tmp/fit-mini \
             --image_encoder_path /tmp/ckpt/image_encoder \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-            --output_dir /tmp/output
+            --output_dir /tmp/output \
+            --gcs_checkpoint_bucket ma-idm-vton-data \
+            --gcs_checkpoint_prefix checkpoints \
+            --checkpointing_epoch 1
 
           # Upload resource_profile.json to GCS so it survives container exit.
           # The same JSON is also printed to stdout and visible in Cloud Logging.

@@ -85,7 +85,7 @@ def parse_args():
     parser.add_argument("--noise_offset", type=float, default=None)
     parser.add_argument("--measurement_dropout", type=float, default=0.1)
     # Checkpointing / logging
-    parser.add_argument("--checkpointing_epoch", type=int, default=10)
+    parser.add_argument("--checkpointing_epoch", type=int, default=1)
     parser.add_argument("--logging_steps", type=int, default=1000)
     # Efficiency
     parser.add_argument("--mixed_precision", type=str, default=None, choices=["no", "fp16", "bf16"])
@@ -98,6 +98,13 @@ def parse_args():
     parser.add_argument("--guidance_scale", type=float, default=2.0)
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    # GCS checkpoint persistence (for spot-preemption resilience)
+    parser.add_argument("--gcs_checkpoint_bucket", type=str, default=None,
+                        help="GCS bucket name (no gs:// prefix). If set, checkpoints are uploaded after every save.")
+    parser.add_argument("--gcs_checkpoint_prefix", type=str, default="checkpoints",
+                        help="GCS object prefix under the bucket where checkpoints are stored.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="GCS path (gs://bucket/prefix/checkpoint-N) or local path to resume from.")
     # Misc
     parser.add_argument("--local_rank", type=int, default=-1)
     # Resource profiling: run for N steps then write resource_profile.json and exit.
@@ -110,6 +117,46 @@ def parse_args():
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
     return args
+
+
+def _upload_dir_to_gcs(local_dir: str, bucket_name: str, prefix: str) -> None:
+    """Upload every file under local_dir to gs://bucket_name/prefix/..."""
+    try:
+        from google.cloud import storage as gcs
+    except ImportError:
+        print("google-cloud-storage not installed — skipping GCS upload.")
+        return
+    client = gcs.Client()
+    bucket = client.bucket(bucket_name)
+    local_dir = os.path.abspath(local_dir)
+    for dirpath, _, filenames in os.walk(local_dir):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            rel = os.path.relpath(fpath, local_dir)
+            blob_name = f"{prefix}/{rel}".replace("\\", "/")
+            bucket.blob(blob_name).upload_from_filename(fpath)
+    print(f"Uploaded {local_dir} → gs://{bucket_name}/{prefix}/")
+
+
+def _download_dir_from_gcs(bucket_name: str, prefix: str, local_dir: str) -> None:
+    """Download all objects under gs://bucket_name/prefix/ to local_dir."""
+    try:
+        from google.cloud import storage as gcs
+    except ImportError:
+        raise RuntimeError("google-cloud-storage is required for GCS resume. pip install google-cloud-storage")
+    client = gcs.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix + "/"))
+    if not blobs:
+        raise FileNotFoundError(f"No objects found at gs://{bucket_name}/{prefix}/")
+    for blob in blobs:
+        rel = blob.name[len(prefix) + 1:]
+        if not rel:
+            continue
+        dest = os.path.join(local_dir, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        blob.download_to_filename(dest)
+    print(f"Downloaded gs://{bucket_name}/{prefix}/ → {local_dir}")
 
 
 def main():
@@ -309,6 +356,44 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    first_epoch = 0
+    global_step = 0
+
+    if args.resume_from_checkpoint is not None:
+        resume_path = args.resume_from_checkpoint
+        # Download from GCS if a gs:// URI is given
+        if resume_path.startswith("gs://"):
+            # gs://bucket/prefix/checkpoint-N  →  bucket, prefix/checkpoint-N
+            without_scheme = resume_path[len("gs://"):]
+            bucket_name, gcs_prefix = without_scheme.split("/", 1)
+            local_resume = os.path.join(args.output_dir, "resumed_checkpoint")
+            if accelerator.is_main_process:
+                _download_dir_from_gcs(bucket_name, gcs_prefix, local_resume)
+            accelerator.wait_for_everyone()
+            resume_path = local_resume
+
+        if accelerator.is_main_process:
+            print(f"Resuming from {resume_path}")
+
+        # Reload LoRA weights into the peft-wrapped unet
+        unwrapped = accelerator.unwrap_model(unet)
+        unwrapped.load_adapter(os.path.join(resume_path, "lora"), adapter_name="default")
+
+        # Reload conv_in weights
+        conv_in_state = torch.load(os.path.join(resume_path, "conv_in.pt"), map_location="cpu")
+        unwrapped.base_model.model.conv_in.load_state_dict(conv_in_state)
+
+        # Reload MeasurementEncoder weights
+        menc_state = torch.load(os.path.join(resume_path, "measurement_encoder.pt"), map_location="cpu")
+        accelerator.unwrap_model(measurement_encoder).load_state_dict(menc_state)
+
+        # Derive global_step and first_epoch from checkpoint directory name (checkpoint-<step>)
+        ckpt_name = os.path.basename(resume_path.rstrip("/\\"))
+        if ckpt_name.startswith("checkpoint-"):
+            global_step = int(ckpt_name.split("-")[1])
+            first_epoch = global_step // num_update_steps_per_epoch
+
     # ── Training loop ─────────────────────────────────────────────────────────
     profiling = args.profile_steps > 0
     profile_step_times = []
@@ -321,13 +406,12 @@ def main():
         range(max_steps), desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
-    global_step = 0
     train_loss = 0.0
 
     unet.train()
     measurement_encoder.train()
 
-    for epoch in range(args.num_train_epochs):
+    for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             step_start = time.perf_counter()
             with accelerator.accumulate(unet), accelerator.accumulate(measurement_encoder):
@@ -611,6 +695,12 @@ def main():
                 accelerator.unwrap_model(measurement_encoder).state_dict(),
                 os.path.join(save_path, "measurement_encoder.pt"),
             )
+
+            # Upload checkpoint to GCS so it survives spot preemption
+            if args.gcs_checkpoint_bucket:
+                ckpt_folder = os.path.basename(save_path)
+                gcs_prefix = f"{args.gcs_checkpoint_prefix}/{ckpt_folder}"
+                _upload_dir_to_gcs(save_path, args.gcs_checkpoint_bucket, gcs_prefix)
 
 
 if __name__ == "__main__":
