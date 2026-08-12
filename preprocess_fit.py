@@ -17,6 +17,7 @@ import json
 import os
 import sys
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -73,6 +74,79 @@ def run_densepose(predictor, context, pil_image: Image.Image) -> Image.Image:
 # Main preprocessing loop
 # ---------------------------------------------------------------------------
 
+def expand_mask_for_garment(
+    mask: Image.Image,
+    record: dict,
+    mask_w: int = 384,
+    mask_h: int = 512,
+) -> Image.Image:
+    """
+    Expand an agnostic mask to account for the target garment being larger than
+    the input person's current garment.
+
+    The expansion is driven by measurements already in the record:
+      - Width  : garment_bust / body_bust  → horizontal dilation
+      - Length : garment_length / body_height → vertical extension (bottom only)
+      - Sleeves: garment_sleeve_length / body_height → extra arm reach
+
+    All scale factors are clamped to [1, max_*] so we only ever grow the mask,
+    never shrink it. A small baseline dilation (5 px) is always applied first to
+    avoid leaving a 1-px gap around the input garment's boundary.
+    """
+    # Ratios of target garment dimensions to body dimensions
+    width_ratio  = record["garment_bust"]          / max(record["body_bust"],   1.0)
+    length_ratio = record["garment_length"]         / max(record["body_height"], 1.0)
+    sleeve_ratio = record["garment_sleeve_length"]  / max(record["body_height"], 1.0)
+
+    # Reference "typical" ratios for a normally-fitting upper garment (empirical).
+    # Anything beyond these triggers extra dilation.
+    REF_WIDTH_RATIO  = 1.05   # garment bust ≈ 5 % larger than body bust
+    REF_LENGTH_RATIO = 0.28   # garment covers ~28 % of body height
+    REF_SLEEVE_RATIO = 0.15   # sleeve ≈ 15 % of body height
+
+    # Convert excess ratio to pixel dilation amounts (clamped, never negative)
+    H_SCALE = mask_h / 512.0   # normalise to the canonical 512 px height
+    W_SCALE = mask_w / 384.0
+
+    extra_width  = max(0.0, width_ratio  - REF_WIDTH_RATIO)  * mask_w * 0.5
+    extra_length = max(0.0, length_ratio - REF_LENGTH_RATIO) * mask_h
+    extra_sleeve = max(0.0, sleeve_ratio - REF_SLEEVE_RATIO) * mask_h * 0.5
+
+    # Cap expansions at reasonable maximums (in pixels at canonical resolution)
+    extra_width  = min(extra_width,  int(40 * W_SCALE))
+    extra_length = min(extra_length, int(60 * H_SCALE))
+    extra_sleeve = min(extra_sleeve, int(40 * H_SCALE))
+
+    mask_np = np.array(mask.convert("L"))
+    mask_np = (mask_np > 127).astype(np.uint8) * 255
+
+    # Step 1: baseline dilation to fill boundary gaps from the input garment
+    baseline_px = max(3, int(5 * H_SCALE))
+    mask_np = cv2.dilate(mask_np, np.ones((baseline_px, baseline_px), np.uint8))
+
+    # Step 2: horizontal (bust/width) expansion — symmetric left/right
+    if extra_width >= 1:
+        kw = int(extra_width) * 2 + 1
+        mask_np = cv2.dilate(mask_np, np.ones((1, kw), np.uint8))
+
+    # Step 3: downward (length) extension — pad bottom only by shifting the mask
+    # up by extra_length pixels and dilating, then take union
+    if extra_length >= 1:
+        shift = int(extra_length)
+        shifted = np.zeros_like(mask_np)
+        if shift < mask_h:
+            shifted[:mask_h - shift] = mask_np[shift:]
+        mask_np = np.maximum(mask_np, shifted)
+
+    # Step 4: sleeve reach — symmetric horizontal + slight downward dilation
+    if extra_sleeve >= 1:
+        ksl = int(extra_sleeve) * 2 + 1
+        mask_np = cv2.dilate(mask_np, np.ones((ksl, ksl), np.uint8))
+
+    mask_np = np.clip(mask_np, 0, 255).astype(np.uint8)
+    return Image.fromarray(mask_np)
+
+
 def preprocess(data_root: str, category: str, device: str, gpu_id: int):
     measurements_path = os.path.join(data_root, "measurements.json")
     with open(measurements_path) as f:
@@ -116,6 +190,7 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
                 keypoints = openpose_model(small)
                 model_parse, _ = parsing_model(small)
                 mask, _ = get_mask_location("hd", category, model_parse, keypoints)
+                mask = expand_mask_for_garment(mask, record, mask_w=384, mask_h=512)
                 mask.save(mask_out)
             except Exception as exc:
                 print(f"\n[WARN] mask failed for {record['person']}: {exc}")
