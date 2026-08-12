@@ -162,6 +162,8 @@ class FITDatasetWithMeasurements(data.Dataset):
         measurement_dict = {k: record[k] for k in self.MEASUREMENT_KEYS}
         measurements = normalize_measurements(measurement_dict)  # [7]
 
+        cloth_annotation = record.get("garment_caption") or "an upper garment"
+
         return {
             "person_image": person_image,
             "garment_image": garment_image,
@@ -169,8 +171,8 @@ class FITDatasetWithMeasurements(data.Dataset):
             "pose": pose,
             "mask": mask,
             "masked_person": masked_person,
-            "text_prompts": "model is wearing a garment", #TODO
-            "text_prompts_cloth": "a photo of a garment", #TODO
+            "text_prompts": "model is wearing " + cloth_annotation,
+            "text_prompts_cloth": "a photo of " + cloth_annotation,
             "measurements": measurements,
             "person_filename": target_name,
             "cloth_filename": cloth_name,
