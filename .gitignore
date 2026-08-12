@@ -1,5 +1,6 @@
 # data
 /data_mini_test
+/result_fit
 
 # cache
 __pycache__
