@@ -115,6 +115,13 @@ class FITDatasetWithMeasurements(data.Dataset):
             os.path.join(self.data_root, target_name)
         ).convert("RGB").resize((self.width, self.height))
 
+        # Input person wears a different garment — used for inpainting context,
+        # mask, and densepose (matching what is available at inference time).
+        person_name = record["person"]
+        input_person_pil = Image.open(
+            os.path.join(self.data_root, person_name)
+        ).convert("RGB").resize((self.width, self.height))
+
         target_stem = os.path.splitext(os.path.basename(target_name))[0]
         mask_pil = Image.open(
             os.path.join(self.data_root, "agnostic-mask", f"{target_stem}.png")
@@ -125,19 +132,21 @@ class FITDatasetWithMeasurements(data.Dataset):
         ).convert("RGB").resize((self.width, self.height))
 
         # Initial tensor conversion
-        person_image = self.transform(target_pil)   # [3, H, W], [-1, 1]
+        person_image = self.transform(target_pil)       # [3, H, W], [-1, 1]  (diffusion GT)
+        input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
         cloth_pil = cloth_pil.resize(
             (self.width,self.height)
         )
-        mask = self.to_tensor(mask_pil)[:1]          # [1, H, W], [0, 1]
-        pose = self.to_tensor(densepose_pil)         # [3, H, W], [0, 1]
+        mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
+        pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
 
         # Training augmentations
         if self.phase == "train":
-            # Horizontal flip: applied consistently across cloth (PIL), person, mask, pose
+            # Horizontal flip: applied consistently across all spatially aligned tensors
             if random.random() > 0.5:
                 cloth_pil = self.flip_transform(cloth_pil)
                 person_image = self.flip_transform(person_image)
+                input_person = self.flip_transform(input_person)
                 mask = self.flip_transform(mask)
                 pose = self.flip_transform(pose)
 
@@ -155,8 +164,8 @@ class FITDatasetWithMeasurements(data.Dataset):
         mask[mask >= 0.5] = 1.0
         pose = self.norm(pose)                      # [0, 1] -> [-1, 1]
 
-        # Zero out the garment region from the person image
-        masked_person = person_image * (1.0 - mask)
+        # Zero out the garment region of the input person (not the target)
+        masked_person = input_person * (1.0 - mask)
 
         # Z-score normalize measurements using precomputed dataset statistics
         measurement_dict = {k: record[k] for k in self.MEASUREMENT_KEYS}

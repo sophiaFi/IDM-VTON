@@ -93,7 +93,6 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
     skipped = []
 
     for record in tqdm(records, desc="Preprocessing"):
-        target_path = os.path.join(data_root, record["target"])
         target_stem = os.path.splitext(os.path.basename(record["target"]))[0]
         target_ext  = os.path.splitext(os.path.basename(record["target"]))[1]
 
@@ -104,10 +103,12 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
         if already_done:
             continue
 
-        target_pil = Image.open(target_path).convert("RGB")
+        # Use the input person image (wearing a different garment) — not the target —
+        # so the mask and densepose match what is available at inference time.
+        person_pil = Image.open(os.path.join(data_root, record["person"])).convert("RGB")
 
         # OpenPose + Parsing both expect 384×512
-        small = target_pil.resize((384, 512))
+        small = person_pil.resize((384, 512))
 
         # --- Agnostic mask ---
         if not os.path.exists(mask_out):
@@ -117,8 +118,8 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
                 mask, _ = get_mask_location("hd", category, model_parse, keypoints)
                 mask.save(mask_out)
             except Exception as exc:
-                print(f"\n[WARN] mask failed for {record['target']}: {exc}")
-                skipped.append(("mask", record["target"]))
+                print(f"\n[WARN] mask failed for {record['person']}: {exc}")
+                skipped.append(("mask", record["person"]))
 
         # --- DensePose ---
         if not os.path.exists(pose_out):
@@ -126,8 +127,8 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
                 pose_img = run_densepose(densepose_predictor, densepose_context, small)
                 pose_img.save(pose_out)
             except Exception as exc:
-                print(f"\n[WARN] densepose failed for {record['target']}: {exc}")
-                skipped.append(("densepose", record["target"]))
+                print(f"\n[WARN] densepose failed for {record['person']}: {exc}")
+                skipped.append(("densepose", record["person"]))
 
     if skipped:
         print(f"\nSkipped {len(skipped)} item(s):")
