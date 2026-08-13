@@ -10,6 +10,10 @@ Steps (all idempotent — already-computed outputs are skipped):
 Run from the repo root:
     python preprocess_fit.py --data_root data_mini_test [--device cuda]
     python preprocess_fit.py --data_root data_mini_test --captions-only
+
+Upload results to Google Cloud (e.g. agnostic masks):
+gsutil -m rsync -r data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
+
 """
 
 import argparse

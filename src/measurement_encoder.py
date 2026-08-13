@@ -7,12 +7,12 @@ import torch.nn as nn
 
 class MeasurementEncoder(nn.Module):
     """
-    Encoder for 7 body- und garment measurements
+    Encoder for body/garment measurements + pairwise ease differences.
     Output: Embedding for cross attention in UNet
     """
     def __init__(
         self,
-        num_measurements=7,      # 4 Person + 3 Garment
+        num_measurements=9,      # 4 body + 3 garment + 2 ease differences (bust, hem)
         hidden_dim=256,
         output_dim=768,          # Match CLIP embedding dim
         dropout=0.1,
@@ -60,27 +60,25 @@ class MeasurementEncoder(nn.Module):
                 [body_bust, body_height, body_hips, body_waist,
                  garment_bust, garment_length, garment_sleeve_length]
             measurement_dropout_prob: float - probability to drop measurements
-        
+
         Returns:
-            embeddings: [B, 1, output_dim] - measurement token für Cross-Attention
+            embeddings: [B, 1, output_dim] - measurement token for Cross-Attention
         """
         # Measurement dropout for robustness
         if self.training and measurement_dropout_prob > 0:
             mask = torch.rand_like(measurements) > measurement_dropout_prob
             measurements = measurements * mask
-        
-        # Calculate differences #TODO
-        # bust_diff = garment_bust - body_bust, etc.
-        #body_measures = measurements[:, :4]
-        #garment_measures = measurements[:, 4:]
-        
-        # Simple differences (can be extended)
-        #bust_diff = measurements[:, 4] - measurements[:, 0]  # garment - body bust
-        
+
+        # Ease differences: garment minus body for paired dimensions.
+        # sleeve_length has no body counterpart so is excluded.
+        bust_ease = measurements[:, 4] - measurements[:, 0]  # garment_bust - body_bust
+        hem_drop  = measurements[:, 1] - measurements[:, 5]  # body_height - garment_length
+
         features = torch.cat([
             measurements,
-            #bust_diff.unsqueeze(1),
-        ], dim=1)
+            bust_ease.unsqueeze(1),
+            hem_drop.unsqueeze(1),
+        ], dim=1)  # [B, 9]
         
         if self.use_fourier:
             features = self.fourier(features)
@@ -161,7 +159,7 @@ if __name__ == "__main__":
     
     # Dummy measurements
     batch_size = 4
-    measurements = torch.randn(batch_size, 7)
+    measurements = torch.randn(batch_size, 7)  # raw 7-dim input; encoder adds bust_ease internally
     
     # Forward pass
     embeddings = encoder(measurements)
