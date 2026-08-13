@@ -12,21 +12,22 @@ class MeasurementEncoder(nn.Module):
     """
     def __init__(
         self,
-        num_measurements=9,      # 4 body + 3 garment + 2 ease differences (bust, hem)
+        num_measurements=7,      # raw inputs: 4 body + 3 garment (2 ease diffs appended in forward)
         hidden_dim=256,
         output_dim=768,          # Match CLIP embedding dim
         dropout=0.1,
-        use_fourier=False        # Optional: Fourier Features (similar to FIT))
+        use_fourier=False        # Optional: Fourier Features (similar to FIT)) #TODO: remove?
     ):
         super().__init__()
-        
+
         self.use_fourier = use_fourier
-        
+        mlp_input_dim = num_measurements + 2  # +2 for bust_ease and hem_drop computed in forward()
+
         if use_fourier:
-            self.fourier = FourierFeatureProjection(num_measurements, hidden_dim)
+            self.fourier = FourierFeatureProjection(mlp_input_dim, hidden_dim)
             input_dim = hidden_dim
         else:
-            input_dim = num_measurements
+            input_dim = mlp_input_dim
         
         # MLP Encoder
         self.encoder = nn.Sequential(
