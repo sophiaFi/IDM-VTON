@@ -25,9 +25,10 @@ workerPoolSpecs:
         - |
           set -e
 
-          # google-cloud-storage is not in the Dockerfile; install it here
-          # so we can download the dataset and upload results without gsutil.
-          pip install --quiet google-cloud-storage==2.14.0
+          # google-cloud-storage and google-cloud-logging are not in the Dockerfile;
+          # install them here so we can download/upload via GCS and emit structured
+          # logs to Cloud Logging (severity levels, labels, etc.).
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
 
           # Download dataset and checkpoints from GCS to local disk.
           # Training code uses open() / PIL.Image.open() and from_pretrained()
@@ -60,41 +61,50 @@ workerPoolSpecs:
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
 
-          # Run the profiling training.
+          # Run the test training (2 epochs, 200 datapoints).
           # A100 supports bf16; using it instead of fp16 for better numerical stability.
+          # add --profile_steps 20 \ for training
+          # for uploading checkpoints add:
+          #     --gcs_checkpoint_bucket ma-idm-vton-data \
+          #     --gcs_checkpoint_prefix checkpoints \
+          #     --checkpointing_epoch 1
           accelerate launch \
             --num_processes=1 \
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_measurements.py \
-            --profile_steps 20 \
             --num_train_epochs 2 \
             --train_batch_size 1 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --height 512 \
             --width 384 \
+            --memory_log_steps 10 \
             --data_dir /tmp/fit-mini \
             --image_encoder_path /tmp/ckpt/image_encoder \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-            --output_dir /tmp/output \
-            --gcs_checkpoint_bucket ma-idm-vton-data \
-            --gcs_checkpoint_prefix checkpoints \
-            --checkpointing_epoch 1
+            --output_dir /tmp/output
 
-          # Upload resource_profile.json to GCS so it survives container exit.
-          # The same JSON is also printed to stdout and visible in Cloud Logging.
+          # Upload any files in /tmp/output (images, checkpoints) to GCS
+          # so they survive container exit.
           python - <<'PYEOF'
           from google.cloud import storage
           import pathlib, sys
 
-          src = pathlib.Path("/tmp/output/resource_profile.json")
-          if not src.exists():
-              print("WARNING: resource_profile.json not found — profiling may have failed.", file=sys.stderr)
+          out_dir = pathlib.Path("/tmp/output")
+          if not out_dir.exists():
+              print("WARNING: /tmp/output not found — training may have failed.", file=sys.stderr)
               sys.exit(0)
-          dest_blob = "profile_output/resource_profile.json"
-          storage.Client().bucket("ma-idm-vton-data").blob(dest_blob).upload_from_filename(str(src))
-          print(f"Uploaded to gs://ma-idm-vton-data/{dest_blob}")
+          bucket = storage.Client().bucket("ma-idm-vton-data")
+          uploaded = 0
+          for f in out_dir.rglob("*"):
+              if f.is_file():
+                  rel = f.relative_to(out_dir)
+                  blob_name = f"test_run_output/{rel}".replace("\\", "/")
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  print(f"  uploaded {blob_name}")
+                  uploaded += 1
+          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton-data/test_run_output/")
           PYEOF
 
 

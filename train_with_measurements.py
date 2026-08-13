@@ -28,6 +28,8 @@ import json
 import time
 import itertools
 import math
+import logging as py_logging
+from collections import deque
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -50,6 +52,35 @@ from src.measurement_encoder import MeasurementEncoder
 from ip_adapter.ip_adapter import Resampler
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.training_utils import compute_snr
+
+
+def _setup_cloud_logging(log_name: str = "idm-vton-training") -> py_logging.Logger:
+    """Return a logger that writes to Cloud Logging when available, stdout otherwise."""
+    logger = py_logging.getLogger(log_name)
+    logger.setLevel(py_logging.DEBUG)
+    if not logger.handlers:
+        try:
+            import google.cloud.logging as gcl
+            gcl.Client().setup_logging()
+            logger.info("Cloud Logging handler attached.")
+        except Exception:
+            handler = py_logging.StreamHandler()
+            handler.setFormatter(py_logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            logger.addHandler(handler)
+    return logger
+
+
+def _mem_snapshot(device=None) -> dict:
+    """Return current and peak GPU memory stats in GB. Safe to call on CPU-only runs."""
+    if not torch.cuda.is_available():
+        return {}
+    d = device or torch.cuda.current_device()
+    return {
+        "gpu_alloc_gb": round(torch.cuda.memory_allocated(d) / 1024**3, 3),
+        "gpu_reserved_gb": round(torch.cuda.memory_reserved(d) / 1024**3, 3),
+        "gpu_peak_alloc_gb": round(torch.cuda.max_memory_allocated(d) / 1024**3, 3),
+        "gpu_peak_reserved_gb": round(torch.cuda.max_memory_reserved(d) / 1024**3, 3),
+    }
 
 
 def parse_args():
@@ -111,6 +142,8 @@ def parse_args():
     # Set to 0 (default) to disable and run a full training.
     parser.add_argument("--profile_steps", type=int, default=0,
                         help="If > 0, run this many steps, save a resource profile, and exit.")
+    parser.add_argument("--memory_log_steps", type=int, default=10,
+                        help="Log GPU memory every N steps. 0 = disable.")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -169,6 +202,36 @@ def main():
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    logger = _setup_cloud_logging() if accelerator.is_main_process else None
+
+    # Sliding window of the last 20 allocated-memory readings; used to detect
+    # a monotonic upward trend that would indicate a GPU memory leak.
+    _alloc_history: deque = deque(maxlen=20)
+
+    def _log_mem(tag: str, step: int) -> None:
+        if not accelerator.is_main_process:
+            return
+        snap = _mem_snapshot()
+        if not snap:
+            return
+        msg = (
+            f"[mem] {tag}  step={step}"
+            + "".join(f"  {k}={v}" for k, v in snap.items())
+        )
+        logger.info(msg)
+
+        alloc = snap["gpu_alloc_gb"]
+        _alloc_history.append(alloc)
+        # Warn if every reading in the window is strictly larger than the one before it.
+        if len(_alloc_history) == _alloc_history.maxlen and all(
+            _alloc_history[i] < _alloc_history[i + 1] for i in range(len(_alloc_history) - 1)
+        ):
+            logger.warning(
+                f"[mem-leak?] GPU allocated memory has risen monotonically for "
+                f"{_alloc_history.maxlen} consecutive samples: "
+                f"{_alloc_history[0]:.3f} → {_alloc_history[-1]:.3f} GB"
+            )
 
     # ── Load models ───────────────────────────────────────────────────────────
     noise_scheduler = DDPMScheduler.from_pretrained(
@@ -313,6 +376,7 @@ def main():
         n_lora = sum(p.numel() for p in unet.parameters() if p.requires_grad)
         n_menc = sum(p.numel() for p in measurement_encoder.parameters())
         print(f"Trainable params — LoRA+conv_in: {n_lora:,}  MeasurementEncoder: {n_menc:,}  total: {n_lora + n_menc:,}")
+        _log_mem("after-model-load", 0)
 
     # ── Datasets ──────────────────────────────────────────────────────────────
     train_dataset = FITDatasetWithMeasurements(
@@ -355,6 +419,8 @@ def main():
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    _log_mem("after-accelerator-prepare", 0)
 
     # ── Resume from checkpoint ────────────────────────────────────────────────
     first_epoch = 0
@@ -630,13 +696,29 @@ def main():
                     profile_step_times.append(time.perf_counter() - step_start)
 
             if accelerator.sync_gradients:
-                accelerator.log({"train_loss": train_loss}, step=global_step)
+                snap = _mem_snapshot() if accelerator.is_main_process else {}
+                log_payload = {"train_loss": train_loss}
+                if snap:
+                    log_payload.update({k: v for k, v in snap.items() if "peak" not in k})
+                accelerator.log(log_payload, step=global_step)
                 train_loss = 0.0
+
+            if args.memory_log_steps > 0 and global_step % args.memory_log_steps == 0:
+                _log_mem("train-step", global_step)
 
             progress_bar.set_postfix(step_loss=loss.detach().item())
 
             if global_step >= max_steps:
                 break
+
+        # ── Epoch memory summary ──────────────────────────────────────────────
+        if accelerator.is_main_process and torch.cuda.is_available():
+            snap = _mem_snapshot()
+            logger.info(
+                f"[mem] epoch={epoch} end  "
+                + "  ".join(f"{k}={v}" for k, v in snap.items())
+            )
+            torch.cuda.reset_peak_memory_stats()
 
         # ── Profile report (written once, then exit) ──────────────────────────
         if profiling and global_step >= max_steps and accelerator.is_main_process:
