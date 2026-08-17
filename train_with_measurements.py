@@ -276,20 +276,20 @@ def main():
     image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
     unet.encoder_hid_proj = image_proj_model
 
-    # ── Expand TryonNet input conv 9 → 13 channels ───────────────────────────
-    # Channels: noisy latent (4) | mask (1) | masked-image latent (4) | densepose latent (4)
-    # New columns (9-12) are zero-initialized so the model starts ignoring densepose
-    # and gradually learns to use it.
-    conv_new = torch.nn.Conv2d(
-        in_channels=13, out_channels=unet.conv_in.out_channels, kernel_size=3, padding=1
-    )
-    torch.nn.init.kaiming_normal_(conv_new.weight)
-    conv_new.weight.data *= 0.0
-    conv_new.weight.data[:, :9] = unet.conv_in.weight.data
-    conv_new.bias.data = unet.conv_in.bias.data
-    unet.conv_in = conv_new
-    unet.config["in_channels"] = 13
-    unet.config.in_channels = 13
+    # ── Expand TryonNet input conv 9 → 13 channels if needed ─────────────────
+    # yisol/IDM-VTON already has 13 input channels (noisy latent 4 | mask 1 |
+    # masked-image latent 4 | densepose latent 4), so skip expansion in that case.
+    # Only expand when starting from a raw 9-channel SDXL inpainting base.
+    if unet.conv_in.in_channels == 9:
+        conv_new = torch.nn.Conv2d(
+            in_channels=13, out_channels=unet.conv_in.out_channels, kernel_size=3, padding=1
+        )
+        torch.nn.init.zeros_(conv_new.weight)
+        conv_new.weight.data[:, :9] = unet.conv_in.weight.data
+        conv_new.bias.data = unet.conv_in.bias.data
+        unet.conv_in = conv_new
+        unet.config["in_channels"] = 13
+        unet.config.in_channels = 13
 
     # ── MeasurementEncoder ────────────────────────────────────────────────────
     cross_attn_dim = unet.config.cross_attention_dim  # 2048 for SDXL
@@ -474,6 +474,86 @@ def main():
     )
     train_loss = 0.0
 
+    def _run_validation(tag: str) -> None:
+        """Run one test batch through the pipeline and save images tagged with `tag`."""
+        if not accelerator.is_main_process:
+            return
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            merged_unet = accelerator.unwrap_model(unet).merge_and_unload()
+            newpipe = TryonPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                unet=merged_unet,
+                vae=vae,
+                scheduler=noise_scheduler,
+                tokenizer=tokenizer,
+                tokenizer_2=tokenizer_2,
+                text_encoder=text_encoder,
+                text_encoder_2=text_encoder_2,
+                image_encoder=image_encoder,
+                unet_encoder=unet_encoder,
+                torch_dtype=torch.float16,
+                add_watermarker=False,
+                safety_checker=None,
+            ).to(accelerator.device)
+
+            for sample in test_dataloader:
+                img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
+                num_prompts = len(img_emb_list)
+                prompt = sample["text_prompts"]
+                negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+                if not isinstance(prompt, List):
+                    prompt = [prompt] * num_prompts
+                if not isinstance(negative_prompt, List):
+                    negative_prompt = [negative_prompt] * num_prompts
+
+                image_embeds = torch.cat(img_emb_list, dim=0)
+
+                with torch.inference_mode():
+                    (
+                        prompt_embeds, negative_prompt_embeds,
+                        pooled_prompt_embeds, negative_pooled_prompt_embeds,
+                    ) = newpipe.encode_prompt(
+                        prompt, num_images_per_prompt=1,
+                        do_classifier_free_guidance=True,
+                        negative_prompt=negative_prompt,
+                    )
+                    prompt_cloth = sample["text_prompts_cloth"]
+                    negative_prompt_cloth = "monochrome, lowres, bad anatomy, worst quality, low quality"
+                    if not isinstance(prompt_cloth, List):
+                        prompt_cloth = [prompt_cloth] * num_prompts
+                    if not isinstance(negative_prompt_cloth, List):
+                        negative_prompt_cloth = [negative_prompt_cloth] * num_prompts
+                    (prompt_embeds_c, _, _, _) = newpipe.encode_prompt(
+                        prompt_cloth, num_images_per_prompt=1,
+                        do_classifier_free_guidance=False,
+                        negative_prompt=negative_prompt_cloth,
+                    )
+                    generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed else None
+                    images = newpipe(
+                        prompt_embeds=prompt_embeds,
+                        negative_prompt_embeds=negative_prompt_embeds,
+                        pooled_prompt_embeds=pooled_prompt_embeds,
+                        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                        num_inference_steps=args.num_inference_steps,
+                        generator=generator,
+                        strength=1.0,
+                        pose_img=sample["pose"],
+                        text_embeds_cloth=prompt_embeds_c,
+                        cloth=sample["garment_image"].to(accelerator.device),
+                        mask_image=sample["mask"],
+                        image=(sample["person_image"] + 1.0) / 2.0,
+                        height=args.height,
+                        width=args.width,
+                        guidance_scale=args.guidance_scale,
+                        ip_adapter_image=image_embeds,
+                    )[0]
+                for i, img in enumerate(images):
+                    img.save(os.path.join(args.output_dir, f"{tag}_{i}_test.jpg"))
+                break
+
+            del merged_unet, newpipe
+            torch.cuda.empty_cache()
+
     unet.train()
     measurement_encoder.train()
 
@@ -483,84 +563,12 @@ def main():
             with accelerator.accumulate(unet), accelerator.accumulate(measurement_encoder):
 
                 # ── Validation samples ────────────────────────────────────────
-                if global_step % args.logging_steps == 0 and accelerator.is_main_process:
-                    with torch.no_grad(), torch.cuda.amp.autocast():
-                        # merge_and_unload() returns a plain UNet2DConditionModel with
-                        # LoRA weights merged in, leaving the PeftModel unet unchanged.
-                        merged_unet = accelerator.unwrap_model(unet).merge_and_unload()
-                        newpipe = TryonPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            unet=merged_unet,
-                            vae=vae,
-                            scheduler=noise_scheduler,
-                            tokenizer=tokenizer,
-                            tokenizer_2=tokenizer_2,
-                            text_encoder=text_encoder,
-                            text_encoder_2=text_encoder_2,
-                            image_encoder=image_encoder,
-                            unet_encoder=unet_encoder,
-                            torch_dtype=torch.float16,
-                            add_watermarker=False,
-                            safety_checker=None,
-                        ).to(accelerator.device)
-
-                        for sample in test_dataloader:
-                            img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
-                            num_prompts = len(img_emb_list)
-                            prompt = sample["text_prompts"]
-                            negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-                            if not isinstance(prompt, List):
-                                prompt = [prompt] * num_prompts
-                            if not isinstance(negative_prompt, List):
-                                negative_prompt = [negative_prompt] * num_prompts
-
-                            image_embeds = torch.cat(img_emb_list, dim=0)
-
-                            with torch.inference_mode():
-                                (
-                                    prompt_embeds, negative_prompt_embeds,
-                                    pooled_prompt_embeds, negative_pooled_prompt_embeds,
-                                ) = newpipe.encode_prompt(
-                                    prompt, num_images_per_prompt=1,
-                                    do_classifier_free_guidance=True,
-                                    negative_prompt=negative_prompt,
-                                )
-                                prompt_cloth = sample["text_prompts_cloth"]
-                                negative_prompt_cloth = "monochrome, lowres, bad anatomy, worst quality, low quality"
-                                if not isinstance(prompt_cloth, List):
-                                    prompt_cloth = [prompt_cloth] * num_prompts
-                                if not isinstance(negative_prompt_cloth, List):
-                                    negative_prompt_cloth = [negative_prompt_cloth] * num_prompts
-                                (prompt_embeds_c, _, _, _) = newpipe.encode_prompt(
-                                    prompt_cloth, num_images_per_prompt=1,
-                                    do_classifier_free_guidance=False,
-                                    negative_prompt=negative_prompt_cloth,
-                                )
-                                generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed else None
-                                images = newpipe(
-                                    prompt_embeds=prompt_embeds,
-                                    negative_prompt_embeds=negative_prompt_embeds,
-                                    pooled_prompt_embeds=pooled_prompt_embeds,
-                                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                                    num_inference_steps=args.num_inference_steps,
-                                    generator=generator,
-                                    strength=1.0,
-                                    pose_img=sample["pose"],
-                                    text_embeds_cloth=prompt_embeds_c,
-                                    cloth=sample["garment_image"].to(accelerator.device),
-                                    mask_image=sample["mask"],
-                                    image=(sample["person_image"] + 1.0) / 2.0,
-                                    height=args.height,
-                                    width=args.width,
-                                    guidance_scale=args.guidance_scale,
-                                    ip_adapter_image=image_embeds,
-                                )[0]
-                            for i, img in enumerate(images):
-                                img.save(os.path.join(args.output_dir, f"{global_step}_{i}_test.jpg"))
-                            break
-
-                        del merged_unet, newpipe
-                        torch.cuda.empty_cache()
+                if global_step % args.logging_steps == 0:
+                    unet.eval()
+                    measurement_encoder.eval()
+                    _run_validation(tag=str(global_step))
+                    unet.train()
+                    measurement_encoder.train()
 
                 # ── Encode images to latents ──────────────────────────────────
                 pixel_values = batch["person_image"].to(dtype=vae.dtype)
@@ -783,6 +791,12 @@ def main():
                 ckpt_folder = os.path.basename(save_path)
                 gcs_prefix = f"{args.gcs_checkpoint_prefix}/{ckpt_folder}"
                 _upload_dir_to_gcs(save_path, args.gcs_checkpoint_bucket, gcs_prefix)
+
+    # ── Final validation after training ──────────────────────────────────────
+    unet.eval()
+    measurement_encoder.eval()
+    _run_validation(tag="final")
+    accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

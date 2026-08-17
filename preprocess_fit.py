@@ -8,8 +8,7 @@ Steps (all idempotent — already-computed outputs are skipped):
      "garment_caption" on each record.
 
 Run from the repo root:
-    python preprocess_fit.py --data_root data_mini_test [--device cuda]
-    python preprocess_fit.py --data_root data_mini_test --captions-only
+    python preprocess_fit.py --data_root data_mini_test [--captions-only] [--expand-mask] [--device cuda]
 
 Upload results to Google Cloud (e.g. agnostic masks):
 gsutil -m rsync -r data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
@@ -133,25 +132,24 @@ def expand_mask_for_garment(
         kw = int(extra_width) * 2 + 1
         mask_np = cv2.dilate(mask_np, np.ones((1, kw), np.uint8))
 
-    # Step 3: downward (length) extension — pad bottom only by shifting the mask
-    # up by extra_length pixels and dilating, then take union
+    # Step 3: downward (length) extension — extend bottom edge by shift pixels
     if extra_length >= 1:
         shift = int(extra_length)
         shifted = np.zeros_like(mask_np)
         if shift < mask_h:
-            shifted[:mask_h - shift] = mask_np[shift:]
+            shifted[shift:] = mask_np[:mask_h - shift]
         mask_np = np.maximum(mask_np, shifted)
 
-    # Step 4: sleeve reach — symmetric horizontal + slight downward dilation
+    # Step 4: sleeve reach — horizontal only (arms extend outward, not upward)
     if extra_sleeve >= 1:
         ksl = int(extra_sleeve) * 2 + 1
-        mask_np = cv2.dilate(mask_np, np.ones((ksl, ksl), np.uint8))
+        mask_np = cv2.dilate(mask_np, np.ones((1, ksl), np.uint8))
 
     mask_np = np.clip(mask_np, 0, 255).astype(np.uint8)
     return Image.fromarray(mask_np)
 
 
-def preprocess(data_root: str, category: str, device: str, gpu_id: int):
+def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_mask: bool = False):
     measurements_path = os.path.join(data_root, "measurements.json")
     with open(measurements_path) as f:
         records = json.load(f)
@@ -194,7 +192,8 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int):
                 keypoints = openpose_model(small)
                 model_parse, _ = parsing_model(small)
                 mask, _ = get_mask_location("hd", category, model_parse, keypoints)
-                mask = expand_mask_for_garment(mask, record, mask_w=384, mask_h=512)
+                if expand_mask:
+                    mask = expand_mask_for_garment(mask, record, mask_w=384, mask_h=512)
                 mask.save(mask_out)
             except Exception as exc:
                 print(f"\n[WARN] mask failed for {record['person']}: {exc}")
@@ -357,6 +356,10 @@ def main():
         help="GPU id passed to Parsing and OpenPose constructors (default: 0)",
     )
     parser.add_argument(
+        "--expand-mask", action="store_true",
+        help="Expand agnostic masks based on garment/body measurement ratios. Off by default.",
+    )
+    parser.add_argument(
         "--captions-only", action="store_true",
         help="Skip mask/densepose generation and only run BLIP-2 captioning.",
     )
@@ -374,6 +377,7 @@ def main():
             category=args.category,
             device=args.device,
             gpu_id=args.gpu_id,
+            expand_mask=args.expand_mask,
         )
 
     generate_captions(
