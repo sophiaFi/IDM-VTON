@@ -36,7 +36,7 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler
 from transformers import (
-    CLIPTextModel, CLIPTokenizer,
+    CLIPImageProcessor, CLIPTextModel, CLIPTokenizer,
     CLIPVisionModelWithProjection, CLIPTextModelWithProjection,
 )
 from peft import LoraConfig, get_peft_model
@@ -86,10 +86,13 @@ def _mem_snapshot(device=None) -> dict:
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser(description="IDM-VTON + LoRA + MeasurementEncoder training on FIT dataset.")
-    parser.add_argument("--pretrained_model_name_or_path", type=str, default="diffusers/stable-diffusion-xl-1.0-inpainting-0.1")
-    parser.add_argument("--pretrained_garmentnet_path", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
-    parser.add_argument("--pretrained_ip_adapter_path", type=str, default="ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin")
-    parser.add_argument("--image_encoder_path", type=str, default="ckpt/image_encoder")
+    parser.add_argument("--pretrained_model_name_or_path", type=str, default="yisol/IDM-VTON")
+    parser.add_argument("--pretrained_garmentnet_path", type=str, default=None,
+                        help="GarmentNet source. Defaults to --pretrained_model_name_or_path with subfolder 'unet_encoder' (correct for yisol/IDM-VTON).")
+    parser.add_argument("--pretrained_ip_adapter_path", type=str, default=None,
+                        help="Path to IP-Adapter .bin. Defaults to ip_adapter/ip-adapter-plus_sdxl_vit-h.bin inside --pretrained_model_name_or_path.")
+    parser.add_argument("--image_encoder_path", type=str, default=None,
+                        help="Path to CLIP image encoder. Defaults to image_encoder/ inside --pretrained_model_name_or_path.")
     parser.add_argument("--data_dir", type=str, default="gs://ma-idm-vton-data/datasets/fit-mini")
     parser.add_argument("--output_dir", type=str, default="output")
     # LoRA
@@ -242,9 +245,15 @@ def main():
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
     text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder_2")
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", torch_dtype=torch.float16)
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained(args.image_encoder_path)
+    image_encoder_path = args.image_encoder_path or args.pretrained_model_name_or_path
+    image_encoder_subfolder = None if args.image_encoder_path else "image_encoder"
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+        image_encoder_path, subfolder=image_encoder_subfolder
+    )
 
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(args.pretrained_garmentnet_path, subfolder="unet")
+    garmentnet_path = args.pretrained_garmentnet_path or args.pretrained_model_name_or_path
+    garmentnet_subfolder = "unet" if args.pretrained_garmentnet_path else "unet_encoder"
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(garmentnet_path, subfolder=garmentnet_subfolder)
     unet_encoder.config.addition_embed_type = None
     unet_encoder.config["addition_embed_type"] = None
 
@@ -257,7 +266,17 @@ def main():
     unet.config["encoder_hid_dim_type"] = "ip_image_proj"
 
     # ── IP-Adapter weights → attention processors ─────────────────────────────
-    state_dict = torch.load(args.pretrained_ip_adapter_path, map_location="cpu")
+    if args.pretrained_ip_adapter_path:
+        ip_bin = args.pretrained_ip_adapter_path
+    elif os.path.isdir(args.pretrained_model_name_or_path):
+        ip_bin = os.path.join(args.pretrained_model_name_or_path, "ip_adapter", "ip-adapter-plus_sdxl_vit-h.bin")
+    else:
+        from huggingface_hub import hf_hub_download
+        ip_bin = hf_hub_download(
+            repo_id=args.pretrained_model_name_or_path,
+            filename="ip_adapter/ip-adapter-plus_sdxl_vit-h.bin",
+        )
+    state_dict = torch.load(ip_bin, map_location="cpu")
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
 
@@ -491,6 +510,7 @@ def main():
                 text_encoder_2=text_encoder_2,
                 image_encoder=image_encoder,
                 unet_encoder=unet_encoder,
+                feature_extractor=CLIPImageProcessor(),
                 torch_dtype=torch.float16,
                 add_watermarker=False,
                 safety_checker=None,

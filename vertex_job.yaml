@@ -57,13 +57,13 @@ workerPoolSpecs:
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
           download_prefix("datasets/fit-mini/", "/tmp/fit-mini")
-          download_prefix("ckpt/image_encoder/", "/tmp/ckpt/image_encoder")
+          download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
 
           # Run the test training (2 epochs, 200 datapoints).
           # A100 supports bf16; using it instead of fp16 for better numerical stability.
-          # add --profile_steps 20 \ for training
+          # add --profile_steps 20 \ for profiling only
           # for uploading checkpoints add:
           #     --gcs_checkpoint_bucket ma-idm-vton-data \
           #     --gcs_checkpoint_prefix checkpoints \
@@ -81,7 +81,7 @@ workerPoolSpecs:
             --width 384 \
             --memory_log_steps 10 \
             --data_dir /tmp/fit-mini \
-            --image_encoder_path /tmp/ckpt/image_encoder \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output
 
