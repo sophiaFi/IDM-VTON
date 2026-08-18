@@ -102,22 +102,20 @@ class FITDatasetWithMeasurements(data.Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
-        id = record["id"]
+        #id = record["id"] #TODO: use id instead?
         target_name = record["target"]
         cloth_name = record["cloth"]
+        person_name = record["person"]
 
         # Load images
         cloth_pil = Image.open(
             os.path.join(self.data_root, cloth_name)
-        ).convert("RGB")
+        ).convert("RGB").resize((self.width, self.height))
 
         target_pil = Image.open(
             os.path.join(self.data_root, target_name)
         ).convert("RGB").resize((self.width, self.height))
 
-        # Input person wears a different garment — used for inpainting context,
-        # mask, and densepose (matching what is available at inference time).
-        person_name = record["person"]
         input_person_pil = Image.open(
             os.path.join(self.data_root, person_name)
         ).convert("RGB").resize((self.width, self.height))
@@ -134,9 +132,6 @@ class FITDatasetWithMeasurements(data.Dataset):
         # Initial tensor conversion
         person_image = self.transform(target_pil)       # [3, H, W], [-1, 1]  (diffusion GT)
         input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
-        cloth_pil = cloth_pil.resize(
-            (self.width,self.height)
-        )
         mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
         pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
 

@@ -36,7 +36,7 @@ from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 from diffusers import AutoencoderKL, DDPMScheduler
 from transformers import (
-    CLIPImageProcessor, CLIPTextModel, CLIPTokenizer,
+    CLIPTextModel, CLIPTokenizer,
     CLIPVisionModelWithProjection, CLIPTextModelWithProjection,
 )
 from peft import LoraConfig, get_peft_model
@@ -237,9 +237,7 @@ def main():
             )
 
     # ── Load models ───────────────────────────────────────────────────────────
-    noise_scheduler = DDPMScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler", rescale_betas_zero_snr=True
-    )
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", rescale_betas_zero_snr=True)
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
@@ -257,9 +255,7 @@ def main():
     unet_encoder.config.addition_embed_type = None
     unet_encoder.config["addition_embed_type"] = None
 
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", low_cpu_mem_usage=False, device_map=None
-    )
+    unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", low_cpu_mem_usage=False, device_map=None)
     unet.config.encoder_hid_dim = image_encoder.config.hidden_size
     unet.config.encoder_hid_dim_type = "ip_image_proj"
     unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
@@ -268,14 +264,8 @@ def main():
     # ── IP-Adapter weights → attention processors ─────────────────────────────
     if args.pretrained_ip_adapter_path:
         ip_bin = args.pretrained_ip_adapter_path
-    elif os.path.isdir(args.pretrained_model_name_or_path):
-        ip_bin = os.path.join(args.pretrained_model_name_or_path, "ip_adapter", "ip-adapter-plus_sdxl_vit-h.bin")
     else:
-        from huggingface_hub import hf_hub_download
-        ip_bin = hf_hub_download(
-            repo_id=args.pretrained_model_name_or_path,
-            filename="ip_adapter/ip-adapter-plus_sdxl_vit-h.bin",
-        )
+        ip_bin = os.path.join(args.pretrained_model_name_or_path, "ip_adapter", "ip-adapter-plus_sdxl_vit-h.bin")
     state_dict = torch.load(ip_bin, map_location="cpu")
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
@@ -510,7 +500,7 @@ def main():
                 text_encoder_2=text_encoder_2,
                 image_encoder=image_encoder,
                 unet_encoder=unet_encoder,
-                feature_extractor=CLIPImageProcessor(),
+                feature_extractor=None,
                 torch_dtype=torch.float16,
                 add_watermarker=False,
                 safety_checker=None,
