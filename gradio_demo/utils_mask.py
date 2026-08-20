@@ -405,6 +405,8 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                         )
 
                 if debug_dir is not None:
+                    # Visualize important points and lines used for calculations
+
                     # Column corridor used by _garment_vertical_extent_px
                     if torso_bounds is not None:
                         viz_l, viz_r = torso_bounds
