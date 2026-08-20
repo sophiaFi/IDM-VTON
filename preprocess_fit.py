@@ -181,7 +181,8 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
                     torso_mask = run_densepose_torso_mask(densepose_predictor, small)
                     mask, _ = get_mask_location("hd", category, model_parse, keypoints,
                                             body_bust_cm=record["body_bust"], garment_bust_cm=record["garment_bust"],
-                                            densepose_torso_mask=torso_mask)
+                                            body_hips_cm=record["body_hips"], garment_length_cm=record["garment_length"],
+                                            body_height_cm=record["body_height"], densepose_torso_mask=torso_mask)
                 else:
                     mask, _ = get_mask_location("hd", category, model_parse, keypoints)
 
