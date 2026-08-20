@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import cv2
 from PIL import Image, ImageDraw
@@ -51,7 +52,164 @@ def refine_mask(mask):
 
     return refine_mask
 
-def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384,height=512):
+# Maximum bust expansion added per side in pixels (at 384×512).
+# Caps runaway expansion caused by noisy keypoints or an atypical bust ratio.
+MAX_BUST_EXPANSION_PX = 40
+
+
+def _torso_x_bounds_at_row(
+    torso_mask_np: np.ndarray,
+    bust_y: int,
+    band: int = 5,
+    padding: int = 3,
+) -> tuple | None:
+    """Return (left_x, right_x) of the DensePose torso region at bust_y.
+
+    Scans a band of rows and returns the widest torso span found.
+    The resulting bounds are expanded by `padding` pixels on both sides.
+    Returns None if no torso pixels are found in the band.
+    """
+    h, w = torso_mask_np.shape
+    y0 = max(0, bust_y - band)
+    y1 = min(h, bust_y + band + 1)
+    best_left, best_right, best_width = 0, 0, 0
+    for y in range(y0, y1):
+        cols = np.where(torso_mask_np[y] > 127)[0]
+        if len(cols) == 0:
+            continue
+        span = int(cols[-1]) - int(cols[0]) + 1
+        if span > best_width:
+            best_width = span
+            best_left  = int(cols[0])
+            best_right = int(cols[-1])
+
+    if best_width <= 0:
+        return None
+
+    # add padding
+    best_left = max(0, best_left - padding)
+    best_right = min(w - 1, best_right + padding)
+
+    return best_left, best_right
+
+
+def _mask_bust_width_px_clipped(
+    mask_np: np.ndarray,
+    bust_y: int,
+    clip_left: int,
+    clip_right: int,
+    band: int = 5,
+) -> float:
+    """Return the width of the garment mask at bust_y, restricted to [clip_left, clip_right].
+
+    Counts all white pixels in that column range across the band and returns
+    the span from the leftmost to rightmost hit. Returns 0.0 if none found.
+    """
+    h, w = mask_np.shape
+    y0 = max(0, bust_y - band)
+    y1 = min(h, bust_y + band + 1)
+    clip_l = max(0, clip_left)
+    clip_r = min(w - 1, clip_right)
+    best_left, best_right, found = clip_r, clip_l, False
+    for y in range(y0, y1):
+        row = mask_np[y, clip_l:clip_r + 1] > 127
+        cols = np.where(row)[0]
+        if len(cols) == 0:
+            continue
+        found = True
+        best_left  = min(best_left,  clip_l + int(cols[0]))
+        best_right = max(best_right, clip_l + int(cols[-1]))
+    return float(best_right - best_left + 1) if found else 0.0
+
+
+def get_bust_measurement_lines(
+    keypoint: dict,
+    mask: Image.Image,
+    densepose_torso_mask: np.ndarray | None = None,
+    height: int = 512,
+    bust_fraction: float = 0.25,
+    band: int = 5,
+) -> dict:
+    """Return the two bust measurement lines used during mask expansion.
+
+    Both lines are horizontal and share the same y-coordinate (bust_y).
+
+    When densepose_torso_mask is provided (a uint8 HxW array, 255 = torso),
+    the mask measurement is clipped to the DensePose torso column range so
+    sleeve pixels are excluded. Without it, the full mask width is returned.
+
+    Returns a dict with:
+      bust_y            — the row at which bust lines are drawn
+      body_line         — ((x0, y), (x1, y)) spanning body_bust_px, centred on midpoint_x
+      mask_line         — ((x0, y), (x1, y)) spanning the garment mask within the
+                          torso corridor, or None if no mask pixels found there
+      torso_bounds      — (left_x, right_x) from DensePose, or None
+      left_shoulder     — (x, y)
+      left_hip          — (x, y)
+      right_shoulder    — (x, y)
+      right_hip         — (x, y)
+    """
+    pose_data = np.array(keypoint["pose_keypoints_2d"]).reshape(-1, 2).astype(np.float32)
+    scale = height / 512.0
+    left_shoulder  = pose_data[2, :2] * scale
+    right_shoulder = pose_data[5, :2] * scale
+    left_hip       = pose_data[8, :2] * scale
+    right_hip      = pose_data[11, :2] * scale
+    left_bust_pt   = left_shoulder  + bust_fraction * (left_hip  - left_shoulder)
+    right_bust_pt  = right_shoulder + bust_fraction * (right_hip - right_shoulder)
+
+    body_bust_px = float(np.linalg.norm(right_bust_pt - left_bust_pt))
+    bust_y       = int(round((left_bust_pt[1] + right_bust_pt[1]) / 2.0))
+    midpoint_x   = int(round((left_bust_pt[0] + right_bust_pt[0]) / 2.0))
+
+    half_body = body_bust_px / 2.0
+    body_line = (
+        (midpoint_x - half_body, bust_y),
+        (midpoint_x + half_body, bust_y),
+    )
+
+    mask_np  = np.array(mask.convert("L"))
+    mask_raw = (mask_np > 127).astype(np.uint8) * 255
+    w = mask_raw.shape[1]
+
+    torso_bounds = None
+    if densepose_torso_mask is not None:
+        torso_np = np.array(densepose_torso_mask)
+        if torso_np.shape != mask_raw.shape:
+            torso_np = cv2.resize(torso_np, (mask_raw.shape[1], mask_raw.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+        torso_bounds = _torso_x_bounds_at_row(torso_np, bust_y, band)
+
+    if torso_bounds is not None:
+        clip_left, clip_right = torso_bounds
+        mask_width = _mask_bust_width_px_clipped(mask_raw, bust_y, clip_left, clip_right, band)
+        mask_midpoint = (clip_left + clip_right) / 2.0
+        mask_line = (
+            (mask_midpoint - mask_width / 2.0, float(bust_y)),
+            (mask_midpoint + mask_width / 2.0, float(bust_y)),
+        ) if mask_width > 0 else None
+    else:
+        # Fallback: full mask width centred on the keypoint midpoint
+        mask_width = _mask_bust_width_px_clipped(mask_raw, bust_y, 0, w - 1, band)
+        mask_line = (
+            (midpoint_x - mask_width / 2.0, float(bust_y)),
+            (midpoint_x + mask_width / 2.0, float(bust_y)),
+        ) if mask_width > 0 else None
+
+    return {
+        "bust_y":          bust_y,
+        "body_line":       body_line,
+        "mask_line":       mask_line,
+        "torso_bounds":    torso_bounds,
+        "left_shoulder":   tuple(left_shoulder.tolist()),
+        "left_hip":        tuple(left_hip.tolist()),
+        "right_shoulder":  tuple(right_shoulder.tolist()),
+        "right_hip":       tuple(right_hip.tolist()),
+    }
+
+
+def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512,
+                      body_bust_cm: float = None, garment_bust_cm: float = None, densepose_torso_mask: np.ndarray | None = None):
     im_parse = model_parse.resize((width, height), Image.NEAREST)
     parse_array = np.array(im_parse)
 
@@ -144,7 +302,73 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
         parser_mask_fixed += hands_left + hands_right
 
     parser_mask_fixed = np.logical_or(parser_mask_fixed, parse_head)
-    parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=5)
+
+    # Snapshot the raw mask first so step 3 measures the undilated garment region
+    parse_mask_raw = (parse_mask > 0.5).astype(np.uint8) * 255
+    # Small base dilation to smooth the garment boundary
+    parse_mask = cv2.dilate(parse_mask, np.ones((5, 5), np.uint16), iterations=2)
+
+    # Bust-driven horizontal expansion (upper_body / dresses only)
+    if (category in ('upper_body', 'dresses')
+            and body_bust_cm is not None
+            and garment_bust_cm is not None):
+
+        bust_ratio = garment_bust_cm / max(body_bust_cm, 1e-6)
+
+        if bust_ratio > 1.0:
+            # Body bust width in pixels from keypoints
+            pose_data_bust = np.array(keypoint["pose_keypoints_2d"]).reshape(-1, 2).astype(np.float32)
+            bust_fraction = 0.25
+            left_shoulder  = pose_data_bust[2, :2] * (height / 512.0)
+            right_shoulder = pose_data_bust[5, :2] * (height / 512.0)
+            left_hip       = pose_data_bust[8, :2] * (height / 512.0)
+            right_hip      = pose_data_bust[11, :2] * (height / 512.0)
+            left_bust_pt   = left_shoulder  + bust_fraction * (left_hip  - left_shoulder)
+            right_bust_pt  = right_shoulder + bust_fraction * (right_hip - right_shoulder)
+            body_bust_px   = float(np.linalg.norm(right_bust_pt - left_bust_pt))
+
+            # Target mask bust width in pixels
+            target_mask_bust_px = body_bust_px * bust_ratio
+
+            print(f"target_mask_bust_px: {target_mask_bust_px}")
+
+            # Current torso bust width from the raw pre-dilation mask,
+            # clipped to the DensePose torso column range to exclude sleeves
+            # Falls back to full mask width if no torso mask is available
+            bust_y     = int(round((left_bust_pt[1] + right_bust_pt[1]) / 2.0))
+
+            torso_np = None
+            if densepose_torso_mask is not None:
+                torso_np = np.array(densepose_torso_mask)
+                if torso_np.shape != parse_mask_raw.shape:
+                    torso_np = cv2.resize(torso_np, (width, height),
+                                          interpolation=cv2.INTER_NEAREST)
+
+            torso_bounds = _torso_x_bounds_at_row(torso_np, bust_y) if torso_np is not None else None
+
+            if torso_bounds is not None:
+                clip_left, clip_right = torso_bounds
+            else:
+                clip_left, clip_right = 0, width - 1
+
+            current_mask_bust_px = _mask_bust_width_px_clipped(
+                parse_mask_raw, bust_y, clip_left, clip_right,
+            )
+
+            print(f"current_mask_bust_px: {current_mask_bust_px}")
+
+            # Expand horizontally if the torso region is narrower than needed
+            if current_mask_bust_px > 0 and current_mask_bust_px < target_mask_bust_px:
+                extra_each_side = int(round((target_mask_bust_px - current_mask_bust_px) / 2.0))
+                extra_each_side = min(extra_each_side, MAX_BUST_EXPANSION_PX)
+                print(f"extra_each_side: {extra_each_side}")
+                if extra_each_side >= 1:
+                    kernel_w = 2 * extra_each_side + 1
+                    parse_mask = cv2.dilate(
+                        parse_mask.astype(np.uint8),
+                        np.ones((1, kernel_w), np.uint8),
+                    )
+
     if category == 'dresses' or category == 'upper_body':
         neck_mask = (parse_array == 18).astype(np.float32)
         neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)

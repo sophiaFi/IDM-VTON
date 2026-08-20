@@ -1,6 +1,11 @@
 # data
 /data_mini_test
+
+# outputs
 /result_fit
+/debug_mask
+*.png
+*.jpg
 
 # cache
 __pycache__
