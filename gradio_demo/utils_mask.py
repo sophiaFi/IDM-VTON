@@ -468,7 +468,7 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
         neck_mask = cv2.dilate(neck_mask, np.ones((5, 5), np.uint16), iterations=1)
         neck_mask = np.logical_and(neck_mask, np.logical_not(parse_head))
         parse_mask = np.logical_or(parse_mask, neck_mask)
-        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=4)
+        arm_mask = cv2.dilate(np.logical_or(im_arms_left, im_arms_right).astype('float32'), np.ones((5, 5), np.uint16), iterations=2)
         parse_mask += np.logical_or(parse_mask, arm_mask)
 
     parse_mask = np.logical_and(parser_mask_changeable, np.logical_not(parse_mask))
