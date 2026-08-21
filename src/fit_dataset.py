@@ -145,7 +145,42 @@ class FITDatasetWithMeasurements(data.Dataset):
                 mask = self.flip_transform(mask)
                 pose = self.flip_transform(pose)
 
-            #TODO: augmentation
+            # Color jitter: same params applied to garment and person so lighting stays consistent
+            if random.random() > 0.5:
+                color_jitter = transforms.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.5, hue=0.5)
+                fn_idx, b, c, s, h = transforms.ColorJitter.get_params(
+                    color_jitter.brightness, color_jitter.contrast,
+                    color_jitter.saturation, color_jitter.hue,
+                )
+                person_image = TF.adjust_contrast(person_image, c)
+                person_image = TF.adjust_brightness(person_image, b)
+                person_image = TF.adjust_hue(person_image, h)
+                person_image = TF.adjust_saturation(person_image, s)
+                input_person = TF.adjust_contrast(input_person, c)
+                input_person = TF.adjust_brightness(input_person, b)
+                input_person = TF.adjust_hue(input_person, h)
+                input_person = TF.adjust_saturation(input_person, s)
+                cloth_pil = TF.adjust_contrast(cloth_pil, c)
+                cloth_pil = TF.adjust_brightness(cloth_pil, b)
+                cloth_pil = TF.adjust_hue(cloth_pil, h)
+                cloth_pil = TF.adjust_saturation(cloth_pil, s)
+
+            # Scale: cloth is a separate photo and not scaled with the person
+            if random.random() > 0.5:
+                scale_val = random.uniform(0.8, 1.2)
+                person_image = TF.affine(person_image, angle=0, translate=[0, 0], scale=scale_val, shear=0)
+                input_person = TF.affine(input_person, angle=0, translate=[0, 0], scale=scale_val, shear=0)
+                mask         = TF.affine(mask,         angle=0, translate=[0, 0], scale=scale_val, shear=0)
+                pose         = TF.affine(pose,         angle=0, translate=[0, 0], scale=scale_val, shear=0)
+
+            # Translate
+            if random.random() > 0.5:
+                shift_x = random.uniform(-0.2, 0.2)
+                shift_y = random.uniform(-0.2, 0.2)
+                person_image = TF.affine(person_image, angle=0, translate=[shift_x * person_image.shape[-1], shift_y * person_image.shape[-2]], scale=1, shear=0)
+                input_person = TF.affine(input_person, angle=0, translate=[shift_x * input_person.shape[-1], shift_y * input_person.shape[-2]], scale=1, shear=0)
+                mask         = TF.affine(mask,         angle=0, translate=[shift_x * mask.shape[-1],         shift_y * mask.shape[-2]],         scale=1, shear=0)
+                pose         = TF.affine(pose,         angle=0, translate=[shift_x * pose.shape[-1],         shift_y * pose.shape[-2]],         scale=1, shear=0)
 
         # Garment tensors — built after all cloth_pil augmentations are done
         garment_image_clip = self.clip_processor(
