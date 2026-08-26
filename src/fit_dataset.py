@@ -55,6 +55,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         garment_image_clip [1, 3, 224, 224] CLIP range  cloth/ image for IP-Adapter
         pose              [3, H, W]       [-1, 1]        precomputed densepose map
         mask              [1, H, W]       {0, 1}         inpaint mask (1 = garment region)
+        garment_mask      [1, H, W]       {0, 1}         GT garment silhouette from garment-mask/
         masked_person     [3, H, W]       [-1, 1]        person_image with garment zeroed out
         text_prompts      str             —              person caption
         text_prompts_cloth str            —              garment caption
@@ -129,10 +130,15 @@ class FITDatasetWithMeasurements(data.Dataset):
             os.path.join(self.data_root, "image-densepose", f"{target_stem}.png")
         ).convert("RGB").resize((self.width, self.height))
 
+        garment_mask_pil = Image.open(
+            os.path.join(self.data_root, "garment-mask", f"{target_stem}.png")
+        ).resize((self.width, self.height), Image.NEAREST)
+
         # Initial tensor conversion
         person_image = self.transform(target_pil)       # [3, H, W], [-1, 1]  (diffusion GT)
         input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
         mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
+        garment_mask = self.to_tensor(garment_mask_pil)[:1]  # [1, H, W], [0, 1]
         pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
 
         # Training augmentations
@@ -143,6 +149,7 @@ class FITDatasetWithMeasurements(data.Dataset):
                 person_image = self.flip_transform(person_image)
                 input_person = self.flip_transform(input_person)
                 mask = self.flip_transform(mask)
+                garment_mask = self.flip_transform(garment_mask)
                 pose = self.flip_transform(pose)
 
             # Color jitter: same params applied to garment and person so lighting stays consistent
@@ -171,6 +178,7 @@ class FITDatasetWithMeasurements(data.Dataset):
                 person_image = TF.affine(person_image, angle=0, translate=[0, 0], scale=scale_val, shear=0)
                 input_person = TF.affine(input_person, angle=0, translate=[0, 0], scale=scale_val, shear=0)
                 mask         = TF.affine(mask,         angle=0, translate=[0, 0], scale=scale_val, shear=0)
+                garment_mask = TF.affine(garment_mask, angle=0, translate=[0, 0], scale=scale_val, shear=0)
                 pose         = TF.affine(pose,         angle=0, translate=[0, 0], scale=scale_val, shear=0)
 
             # Translate
@@ -180,6 +188,7 @@ class FITDatasetWithMeasurements(data.Dataset):
                 person_image = TF.affine(person_image, angle=0, translate=[shift_x * person_image.shape[-1], shift_y * person_image.shape[-2]], scale=1, shear=0)
                 input_person = TF.affine(input_person, angle=0, translate=[shift_x * input_person.shape[-1], shift_y * input_person.shape[-2]], scale=1, shear=0)
                 mask         = TF.affine(mask,         angle=0, translate=[shift_x * mask.shape[-1],         shift_y * mask.shape[-2]],         scale=1, shear=0)
+                garment_mask = TF.affine(garment_mask, angle=0, translate=[shift_x * garment_mask.shape[-1], shift_y * garment_mask.shape[-2]], scale=1, shear=0)
                 pose         = TF.affine(pose,         angle=0, translate=[shift_x * pose.shape[-1],         shift_y * pose.shape[-2]],         scale=1, shear=0)
 
         # Garment tensors — built after all cloth_pil augmentations are done
@@ -188,10 +197,13 @@ class FITDatasetWithMeasurements(data.Dataset):
         ).pixel_values                              # [1, 3, 224, 224]
         garment_image = self.transform(cloth_pil)   # [3, H, W], [-1, 1]
 
-        # Finalize mask and pose
+        # Finalize mask, garment_mask, and pose
         mask = mask.clamp(0, 1)
         mask[mask < 0.5] = 0.0
         mask[mask >= 0.5] = 1.0
+        garment_mask = garment_mask.clamp(0, 1)
+        garment_mask[garment_mask < 0.5] = 0.0
+        garment_mask[garment_mask >= 0.5] = 1.0
         pose = self.norm(pose)                      # [0, 1] -> [-1, 1]
 
         # Zero out the garment region of the input person (not the target)
@@ -209,6 +221,7 @@ class FITDatasetWithMeasurements(data.Dataset):
             "garment_image_clip": garment_image_clip,
             "pose": pose,
             "mask": mask,
+            "garment_mask": garment_mask,
             "masked_person": masked_person,
             "text_prompts": "model is wearing " + cloth_annotation,
             "text_prompts_cloth": "a photo of " + cloth_annotation,
@@ -229,7 +242,7 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as tmp:
         # Build a minimal dummy dataset on disk
-        for subdir in ["cloth", "target", "image-densepose", "agnostic-mask"]:
+        for subdir in ["cloth", "target", "image-densepose", "agnostic-mask", "garment-mask"]:
             os.makedirs(os.path.join(tmp, subdir))
 
         dummy_rgb = Image.fromarray(
@@ -245,9 +258,8 @@ if __name__ == "__main__":
             dummy_rgb.save(os.path.join(tmp, "cloth", image_name))
             dummy_rgb.save(os.path.join(tmp, "target", image_name))
             dummy_rgb.save(os.path.join(tmp, "image-densepose", image_name))
-            dummy_gray.save(
-                os.path.join(tmp, "agnostic-mask", image_name)
-            )
+            dummy_gray.save(os.path.join(tmp, "agnostic-mask", image_name))
+            dummy_gray.save(os.path.join(tmp, "garment-mask", image_name))
             records.append({
                 "id": i,
                 "cloth": f"cloth/{image_name}",
@@ -284,6 +296,7 @@ if __name__ == "__main__":
         print(f"  garment_image_clip:{tuple(batch['garment_image_clip'].shape)}")
         print(f"  pose:              {tuple(batch['pose'].shape)}")
         print(f"  mask:              {tuple(batch['mask'].shape)}")
+        print(f"  garment_mask:      {tuple(batch['garment_mask'].shape)}")
         print(f"  masked_person:     {tuple(batch['masked_person'].shape)}")
         print(f"  measurements:      {tuple(batch['measurements'].shape)}")
         print("\nAll checks passed.")

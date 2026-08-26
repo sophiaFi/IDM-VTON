@@ -2,17 +2,23 @@
 Preprocessing script for the FIT dataset.
 
 Steps (all idempotent — already-computed outputs are skipped):
-  1. Agnostic masks  → {data_root}/agnostic-mask/
-  2. DensePose maps  → {data_root}/image-densepose/
-  3. Garment captions (BLIP-2) → written back into measurements.json as
+  1. Agnostic masks   → {data_root}/agnostic-mask/
+  2. DensePose maps   → {data_root}/image-densepose/
+  3. GT garment masks → {data_root}/garment-mask/
+     Binary silhouette of the worn garment on the target/ image, extracted by
+     running the ATR humanparsing model on the *target* image (person already
+     wearing the garment) and keeping labels 4 (upper-clothes) + 14/15 (arms),
+     with hole-filling.  Used as ground truth for the fit loss in training.
+  4. Garment captions (BLIP-2) → written back into measurements.json as
      "garment_caption" on each record.
 
 Run from the repo root:
     python preprocess_fit.py --data_root data_mini_test [--captions-only] [--expand-mask] [--device cuda]
 
-Upload results to Google Cloud (e.g. agnostic masks, densepose):
+Upload results to Google Cloud (e.g. agnostic masks, densepose, garment masks):
 gsutil -m rsync -r data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
 gsutil -m rsync -r data_mini_test/image-densepose/ gs://ma-idm-vton-data/datasets/fit-mini/image-densepose/
+gsutil -m rsync -r data_mini_test/garment-mask/ gs://ma-idm-vton-data/datasets/fit-mini/garment-mask/
 
 """
 
@@ -130,6 +136,47 @@ def run_densepose_torso_mask(
 
     return torso_mask
 
+# ATR label indices (parsing_atr.onnx, 18-class scheme):
+# 4: upper-clothes, 7: dress
+_GARMENT_LABELS = (4, 7)
+
+def _parsing_to_garment_mask(model_parse: Image.Image) -> Image.Image:
+    """Convert an ATR parsing map to a binary garment mask (0/255, mode L).
+
+    Keeps upper-clothes (4) and dress (7) pixels, applies hole-filling and refinement,
+    and returns a PIL image at the same size as model_parse.
+    """
+    parse_np = np.array(model_parse)  # H×W, uint8 label indices
+    binary = np.zeros_like(parse_np, dtype=np.uint8)
+    for lbl in _GARMENT_LABELS:
+        binary[parse_np == lbl] = 255
+
+    # Hole filling
+    # Add zero padding so floodFill can safely start at (0, 0)
+    padded = np.pad(binary[1:-1, 1:-1], pad_width=1, mode="constant", constant_values=0,)
+    binary_copy = padded.copy()
+    flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), dtype=np.uint8,)
+    # Flood-fill the background starting from the top-left corner
+    cv2.floodFill(padded, flood_mask, (0, 0), 255,)
+    # Invert flooded background -> enclosed holes become white
+    inverted = cv2.bitwise_not(padded)
+    # Combine original mask with filled holes
+    binary = cv2.bitwise_or(binary_copy, inverted)
+
+    # Refinement: keep only the largest contour
+    contours, _ = cv2.findContours(binary.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_TC89_L1,)
+    refined = np.zeros_like(binary, dtype=np.uint8)
+    if contours:
+        areas = [
+            abs(cv2.contourArea(contour, oriented=True))
+            for contour in contours
+        ]
+        largest_idx = areas.index(max(areas))
+        cv2.drawContours(refined, contours, largest_idx, color=255, thickness=-1,)
+
+    return Image.fromarray(refined, mode="L")
+
+
 # ---------------------------------------------------------------------------
 # Main preprocessing loop
 # ---------------------------------------------------------------------------
@@ -139,10 +186,12 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
     with open(measurements_path) as f:
         records = json.load(f)
 
-    out_mask_dir = os.path.join(data_root, "agnostic-mask")
-    out_pose_dir = os.path.join(data_root, "image-densepose")
-    os.makedirs(out_mask_dir, exist_ok=True)
-    os.makedirs(out_pose_dir, exist_ok=True)
+    out_mask_dir    = os.path.join(data_root, "agnostic-mask")
+    out_pose_dir    = os.path.join(data_root, "image-densepose")
+    out_gmask_dir   = os.path.join(data_root, "garment-mask")
+    os.makedirs(out_mask_dir,  exist_ok=True)
+    os.makedirs(out_pose_dir,  exist_ok=True)
+    os.makedirs(out_gmask_dir, exist_ok=True)
 
     print("Loading models...")
     parsing_model = Parsing(gpu_id)
@@ -157,15 +206,16 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
         target_stem = os.path.splitext(os.path.basename(record["target"]))[0]
         target_ext  = os.path.splitext(os.path.basename(record["target"]))[1]
 
-        mask_out  = os.path.join(out_mask_dir, f"{target_stem}{target_ext}")
-        pose_out  = os.path.join(out_pose_dir, f"{target_stem}{target_ext}")
+        mask_out  = os.path.join(out_mask_dir,  f"{target_stem}{target_ext}")
+        pose_out  = os.path.join(out_pose_dir,  f"{target_stem}{target_ext}")
+        gmask_out = os.path.join(out_gmask_dir, f"{target_stem}{target_ext}")
 
-        already_done = os.path.exists(mask_out) and os.path.exists(pose_out)
+        already_done = os.path.exists(mask_out) and os.path.exists(pose_out) and os.path.exists(gmask_out)
         if already_done:
             continue
 
         # Use the input person image (wearing a different garment) — not the target —
-        # so the mask and densepose match what is available at inference time.
+        # so the agnostic mask and densepose match what is available at inference time.
         person_pil = Image.open(os.path.join(data_root, record["person"])).convert("RGB")
 
         # OpenPose + Parsing both expect 384×512
@@ -181,8 +231,8 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
                     torso_mask = run_densepose_torso_mask(densepose_predictor, small)
                     mask, _ = get_mask_location("hd", category, model_parse, keypoints,
                                             body_bust_cm=record["body_bust"], garment_bust_cm=record["garment_bust"],
-                                            body_hips_cm=record["body_hips"], garment_length_cm=record["garment_length"],
-                                            body_height_cm=record["body_height"], densepose_torso_mask=torso_mask)
+                                            garment_length_cm=record["garment_length"], body_height_cm=record["body_height"],
+                                            densepose_torso_mask=torso_mask)
                 else:
                     mask, _ = get_mask_location("hd", category, model_parse, keypoints)
 
@@ -199,6 +249,20 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
             except Exception as exc:
                 print(f"\n[WARN] densepose failed for {record['person']}: {exc}")
                 skipped.append(("densepose", record["person"]))
+
+        # --- GT garment mask (from target image: person already wearing the garment) ---
+        if not os.path.exists(gmask_out):
+            try:
+                target_pil = Image.open(os.path.join(data_root, record["target"])).convert("RGB")
+                target_small = target_pil.resize((384, 512))
+                target_parse, _ = parsing_model(target_small)
+                garment_mask = _parsing_to_garment_mask(target_parse)
+                # Resize back to the original target image dimensions
+                garment_mask = garment_mask.resize(target_pil.size, Image.NEAREST)
+                garment_mask.save(gmask_out)
+            except Exception as exc:
+                print(f"\n[WARN] garment mask failed for {record['target']}: {exc}")
+                skipped.append(("garment-mask", record["target"]))
 
     if skipped:
         print(f"\nSkipped {len(skipped)} item(s):")

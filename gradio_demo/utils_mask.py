@@ -197,7 +197,7 @@ def _garment_vertical_extent_px(
 
 def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: dict, width=384, height=512,
                       body_bust_cm: float = None, garment_bust_cm: float = None,
-                      body_hips_cm: float = None, garment_length_cm: float = None, body_height_cm: float = None,
+                      garment_length_cm: float = None, body_height_cm: float = None,
                       densepose_torso_mask: np.ndarray | None = None,
                       debug_dir: str = None):
     im_parse = model_parse.resize((width, height), Image.NEAREST)
