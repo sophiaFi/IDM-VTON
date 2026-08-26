@@ -38,6 +38,7 @@ from diffusers import AutoencoderKL, DDPMScheduler
 from transformers import (
     CLIPTextModel, CLIPTokenizer,
     CLIPVisionModelWithProjection, CLIPTextModelWithProjection,
+    SegformerForSemanticSegmentation,
 )
 from peft import LoraConfig, get_peft_model
 from tqdm.auto import tqdm
@@ -118,6 +119,14 @@ def parse_args():
     parser.add_argument("--snr_gamma", type=float, default=None)
     parser.add_argument("--noise_offset", type=float, default=None)
     parser.add_argument("--measurement_dropout", type=float, default=0.1)
+    parser.add_argument("--fit_loss_weight", type=float, default=0.1,
+                        help="Weight for the fit loss. 0 disables it.")
+    parser.add_argument("--fit_loss_boundary_weight", type=float, default=0.5,
+                        help="Weight of boundary loss relative to IoU loss inside _compute_fit_loss.")
+    parser.add_argument("--fit_loss_alpha_threshold", type=float, default=0.3,
+                        help="Minimum alpha_t for a sample to contribute to fit loss (filters high-noise steps).")
+    parser.add_argument("--segmenter_model", type=str, default="mattmdjaga/segformer_b2_clothes",
+                        help="HuggingFace model ID for the frozen garment segmenter used in fit loss.")
     # Checkpointing / logging
     parser.add_argument("--checkpointing_epoch", type=int, default=1)
     parser.add_argument("--logging_steps", type=int, default=1000)
@@ -193,6 +202,137 @@ def _download_dir_from_gcs(bucket_name: str, prefix: str, local_dir: str) -> Non
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         blob.download_to_filename(dest)
     print(f"Downloaded gs://{bucket_name}/{prefix}/ → {local_dir}")
+
+
+# SegFormer (mattmdjaga/segformer_b2_clothes) class indices for upper garment.
+# 4: upper-clothes, 7: dress
+_SEGFORMER_GARMENT_IDS = (4, 7)
+
+# SegFormer input normalization (ImageNet mean/std, matching the processor default)
+_SEG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_SEG_STD  = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+_SEG_SIZE = 512  # SegFormer-b2 inference resolution
+
+
+def _boundary_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Differentiable boundary loss between two soft masks [B, 1, H, W].
+
+    Extracts boundaries via max-pool minus erosion (a morphological gradient), then
+    penalises the L1 distance between the two boundary maps.  This pushes the model
+    to align mask edges, not just their interior overlap.
+    """
+    # max-pool(x) - min-pool(x) approximates the morphological gradient (boundary ring)
+    pool = torch.nn.functional.max_pool2d
+    erode = lambda x: -torch.nn.functional.max_pool2d(-x, kernel_size=3, stride=1, padding=1)
+    boundary_pred = pool(pred, kernel_size=3, stride=1, padding=1) - erode(pred)
+    boundary_gt   = pool(gt,   kernel_size=3, stride=1, padding=1) - erode(gt)
+    return torch.nn.functional.l1_loss(boundary_pred, boundary_gt)
+
+
+def _compute_fit_loss(
+    noise_pred: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    timesteps: torch.Tensor,
+    gt_garment_mask: torch.Tensor,
+    noise_scheduler,
+    prediction_type: str,
+    vae,
+    segmenter,
+    alpha_threshold: float = 0.3,
+    boundary_weight: float = 0.5,
+) -> torch.Tensor:
+    """Fit loss: soft IoU + boundary loss between predicted and GT garment silhouette.
+
+    Steps:
+      1. Reconstruct the denoised latent x0_pred from the UNet output.
+      2. Decode x0_pred through the (frozen) VAE to pixel space.
+      3. Run the frozen SegFormer to get soft per-pixel garment logits on the decoded image.
+      4. Compare the soft generated garment mask against the GT mask (from garment-mask/)
+         using soft IoU loss and a morphological boundary loss.
+
+    Only applied at low-noise timesteps (alpha_t > alpha_threshold) where x0_pred is
+    reliable.  Returns 0 if all timesteps in the batch are above the noise threshold
+    (i.e. too noisy to get a usable decode).
+
+    Args:
+        noise_pred:          [B, 4, h, w]  raw UNet output
+        noisy_latents:       [B, 4, h, w]  x_t (latent-space noisy sample)
+        timesteps:           [B]           integer diffusion timesteps
+        gt_garment_mask:     [B, 1, H, W]  GT binary garment mask at full pixel resolution
+        noise_scheduler:     DDPMScheduler
+        prediction_type:     "epsilon" | "v_prediction" | "sample"
+        vae:                 frozen AutoencoderKL  (used for decode only)
+        segmenter:           frozen SegformerForSemanticSegmentation
+        alpha_threshold:     minimum alpha_t for a sample to contribute to the loss
+        boundary_weight:     weight of boundary loss relative to IoU loss
+
+    Returns:
+        scalar loss (0-tensor if no samples pass the alpha threshold)
+    """
+    alphas_cumprod = noise_scheduler.alphas_cumprod.to(noisy_latents.device)
+    alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).to(noisy_latents.dtype)
+
+    # Keep only low-noise samples for a reliable x0 estimate
+    keep = (alpha_t.view(-1) > alpha_threshold)
+    if not keep.any():
+        return torch.tensor(0.0, device=noisy_latents.device, requires_grad=False)
+
+    noise_pred   = noise_pred[keep]
+    noisy_latents = noisy_latents[keep]
+    alpha_t      = alpha_t[keep]
+    gt_mask      = gt_garment_mask[keep].clamp(0, 1).to(noisy_latents.dtype)
+
+    # ── 1. Reconstruct x0_pred ────────────────────────────────────────────────
+    if prediction_type == "epsilon":
+        sqrt_alpha = alpha_t.sqrt()
+        sqrt_one_minus_alpha = (1.0 - alpha_t).sqrt()
+        x0_pred = (noisy_latents - sqrt_one_minus_alpha * noise_pred) / sqrt_alpha.clamp(min=1e-8)
+    elif prediction_type == "v_prediction":
+        sqrt_alpha = alpha_t.sqrt()
+        sqrt_one_minus_alpha = (1.0 - alpha_t).sqrt()
+        x0_pred = sqrt_alpha * noisy_latents - sqrt_one_minus_alpha * noise_pred
+    else:  # "sample"
+        x0_pred = noise_pred
+
+    # ── 2. Decode to pixel space ──────────────────────────────────────────────
+    # VAE decode: latent → [-1, 1] pixel image  [B, 3, H, W]
+    # Cast to VAE dtype (may be fp16) then back to float32 for subsequent ops.
+    decoded = vae.decode(
+        (x0_pred / vae.config.scaling_factor).to(dtype=vae.dtype)
+    ).sample.float()  # [B, 3, H, W], [-1, 1]
+
+    # ── 3. Run frozen SegFormer ───────────────────────────────────────────────
+    # Normalise to ImageNet stats (segformer_b2_clothes was trained on them)
+    decoded_01 = (decoded.clamp(-1, 1) + 1.0) / 2.0          # [0, 1]
+    seg_mean = _SEG_MEAN.to(decoded.device, dtype=decoded.dtype)
+    seg_std  = _SEG_STD.to(decoded.device, dtype=decoded.dtype)
+    seg_input = (decoded_01 - seg_mean) / seg_std             # ImageNet-normalised
+
+    # Resize to SegFormer's expected resolution
+    seg_input_rs = F.interpolate(seg_input, size=(_SEG_SIZE, _SEG_SIZE), mode="bilinear", align_corners=False)
+
+    # segmenter is frozen; gradients flow back through decoded → x0_pred via the VAE decode.
+    # Cast input to segmenter dtype; cast output back to float32 for stable sigmoid.
+    logits = segmenter(
+        pixel_values=seg_input_rs.to(dtype=next(segmenter.parameters()).dtype)
+    ).logits.float()  # [B, num_classes, H/4, W/4]
+
+    # Build soft garment mask: sigmoid-sum of the relevant class logits, upsample to GT size
+    H, W = gt_mask.shape[-2], gt_mask.shape[-1]
+    garment_logits = sum(logits[:, cls_id:cls_id+1] for cls_id in _SEGFORMER_GARMENT_IDS)
+    soft_pred = torch.sigmoid(garment_logits)                 # [B, 1, H/4, W/4] (approx)
+    soft_pred = F.interpolate(soft_pred, size=(H, W), mode="bilinear", align_corners=False)  # [B, 1, H, W]
+
+    # ── 4. Losses ─────────────────────────────────────────────────────────────
+    # Soft IoU loss
+    intersection = (soft_pred * gt_mask).sum(dim=(1, 2, 3))
+    union = (soft_pred + gt_mask - soft_pred * gt_mask).sum(dim=(1, 2, 3)).clamp(min=1e-8)
+    iou_loss = (1.0 - intersection / union).mean()
+
+    # Boundary loss
+    b_loss = _boundary_loss(soft_pred, gt_mask)
+
+    return iou_loss + boundary_weight * b_loss
 
 
 def main():
@@ -361,6 +501,17 @@ def main():
 
     measurement_encoder.requires_grad_(True)
 
+    # ── Garment segmenter for fit loss (frozen, eval, GPU) ────────────────────
+    segmenter = None
+    if args.fit_loss_weight > 0:
+        segmenter = SegformerForSemanticSegmentation.from_pretrained(args.segmenter_model)
+        segmenter.requires_grad_(False)
+        segmenter.eval()
+        # Keep segmenter in float32: bf16 lacks a CUDA bilinear-upsample kernel in
+        # PyTorch 2.0.x, which crashes inside SegFormer's decode head. The segmenter
+        # is frozen so the dtype doesn't affect training numerics.
+        segmenter.to(accelerator.device, dtype=torch.float32)
+
     # ── Optimizer (LoRA params + conv_in + MeasurementEncoder) ───────────────
     if args.use_8bit_adam:
         try:
@@ -482,6 +633,7 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
     train_loss = 0.0
+    train_fit_loss = 0.0
 
     def _run_validation(tag: str) -> None:
         """Run one test batch through the pipeline and save images tagged with `tag`."""
@@ -568,7 +720,7 @@ def main():
     measurement_encoder.train()
 
     for epoch in range(first_epoch, args.num_train_epochs):
-        for step, batch in enumerate(train_dataloader):
+        for _, batch in enumerate(train_dataloader):
             step_start = time.perf_counter()
             with accelerator.accumulate(unet), accelerator.accumulate(measurement_encoder):
 
@@ -693,8 +845,26 @@ def main():
                     loss = (F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                             .mean(dim=list(range(1, noise_pred.ndim))) * weights).mean()
 
+                if args.fit_loss_weight > 0:
+                    fit_loss = _compute_fit_loss(
+                        noise_pred=noise_pred.float(),
+                        noisy_latents=noisy_latents.float(),
+                        timesteps=timesteps,
+                        gt_garment_mask=batch["garment_mask"].to(accelerator.device).float(),
+                        noise_scheduler=noise_scheduler,
+                        prediction_type=noise_scheduler.config.prediction_type,
+                        vae=vae,
+                        segmenter=segmenter,
+                        alpha_threshold=args.fit_loss_alpha_threshold,
+                        boundary_weight=args.fit_loss_boundary_weight,
+                    )
+                    loss = loss + args.fit_loss_weight * fit_loss
+
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                if args.fit_loss_weight > 0:
+                    avg_fit_loss = accelerator.gather(fit_loss.repeat(args.train_batch_size)).mean()
+                    train_fit_loss += avg_fit_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -716,10 +886,13 @@ def main():
             if accelerator.sync_gradients:
                 snap = _mem_snapshot() if accelerator.is_main_process else {}
                 log_payload = {"train_loss": train_loss}
+                if args.fit_loss_weight > 0:
+                    log_payload["train_fit_loss"] = train_fit_loss
                 if snap:
                     log_payload.update({k: v for k, v in snap.items() if "peak" not in k})
                 accelerator.log(log_payload, step=global_step)
                 train_loss = 0.0
+                train_fit_loss = 0.0
 
             if args.memory_log_steps > 0 and global_step % args.memory_log_steps == 0:
                 _log_mem("train-step", global_step)
