@@ -341,10 +341,12 @@ def main():
         mixed_precision=args.mixed_precision,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         project_config=ProjectConfiguration(project_dir=args.output_dir),
+        log_with="tensorboard",
     )
 
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+        accelerator.init_trackers("idm-vton")
 
     logger = _setup_cloud_logging() if accelerator.is_main_process else None
 
@@ -634,6 +636,7 @@ def main():
     )
     train_loss = 0.0
     train_fit_loss = 0.0
+    menc_grad_norm_accum = 0.0
 
     def _run_validation(tag: str) -> None:
         """Run one test batch through the pipeline and save images tagged with `tag`."""
@@ -867,6 +870,15 @@ def main():
                     train_fit_loss += avg_fit_loss.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
+
+                # Accumulate MeasurementEncoder grad norm for logging (before clip)
+                menc_grad_sq = sum(
+                    p.grad.detach().norm().item() ** 2
+                    for p in measurement_encoder.parameters()
+                    if p.grad is not None
+                )
+                menc_grad_norm_accum += menc_grad_sq ** 0.5 / args.gradient_accumulation_steps
+
                 if accelerator.sync_gradients:
                     trainable_params = (
                         [p for p in unet.parameters() if p.requires_grad]
@@ -885,7 +897,7 @@ def main():
 
             if accelerator.sync_gradients:
                 snap = _mem_snapshot() if accelerator.is_main_process else {}
-                log_payload = {"train_loss": train_loss}
+                log_payload = {"train_loss": train_loss, "menc_grad_norm": menc_grad_norm_accum}
                 if args.fit_loss_weight > 0:
                     log_payload["train_fit_loss"] = train_fit_loss
                 if snap:
@@ -893,6 +905,7 @@ def main():
                 accelerator.log(log_payload, step=global_step)
                 train_loss = 0.0
                 train_fit_loss = 0.0
+                menc_grad_norm_accum = 0.0
 
             if args.memory_log_steps > 0 and global_step % args.memory_log_steps == 0:
                 _log_mem("train-step", global_step)
@@ -979,6 +992,7 @@ def main():
     unet.eval()
     measurement_encoder.eval()
     _run_validation(tag="final")
+    accelerator.end_training()
     accelerator.wait_for_everyone()
 
 

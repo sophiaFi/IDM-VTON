@@ -1,0 +1,86 @@
+# Vertex AI CustomJob spec for probe_measurement_sensitivity.py.
+#
+# Usage:
+#   gcloud ai custom-jobs create \
+#       --region=us-central1 \
+#       --display-name=idm-vton-probe \
+#       --config=probe_job.yaml \
+#
+# The probe result is printed to stdout (visible in Cloud Logging) and also
+# uploaded to gs://ma-idm-vton-data/probe_output/probe_result.txt.
+#
+# Update CHECKPOINT_PREFIX to the GCS prefix of the checkpoint to probe,
+# e.g. checkpoints/checkpoint-200
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0 peft
+
+          CHECKPOINT_PREFIX="checkpoints/checkpoint-200"
+
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys, os
+
+          bucket_name = "ma-idm-vton-data"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+                  print(f"  downloaded {blob.name}")
+              print(f"Done: {local_root}  ({len(blobs)} files)")
+
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "checkpoints/checkpoint-200") + "/"
+          download_prefix("scripts/",                    "/tmp/scripts")
+          download_prefix("datasets/fit-mini/",          "/tmp/fit-mini")
+          download_prefix("models/yisol-IDM-VTON/",      "/tmp/yisol-IDM-VTON")
+          download_prefix("ckpt/ip_adapter/",            "/tmp/ckpt/ip_adapter")
+          download_prefix(ckpt_prefix,                   "/tmp/checkpoint")
+          PYEOF
+
+          cp /tmp/scripts/probe_measurement_sensitivity.py /app/probe_measurement_sensitivity.py
+
+          python probe_measurement_sensitivity.py \
+            --checkpoint /tmp/checkpoint \
+            --pretrained_model /tmp/yisol-IDM-VTON \
+            --data_dir /tmp/fit-mini \
+            --height 512 \
+            --width 384 \
+            --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            2>&1 | tee /tmp/probe_result.txt
+
+          python - <<'PYEOF'
+          from google.cloud import storage
+          bucket = storage.Client().bucket("ma-idm-vton-data")
+          bucket.blob("probe_output/probe_result.txt").upload_from_filename("/tmp/probe_result.txt")
+          print("Uploaded probe result to gs://ma-idm-vton-data/probe_output/probe_result.txt")
+          PYEOF
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
