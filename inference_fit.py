@@ -31,14 +31,11 @@ Example (after training):
 
 import argparse
 import os
-import sys
-from typing import List
 
 import torch
-import torchvision
 from accelerate import Accelerator
 from accelerate.utils import set_seed
-from diffusers import AutoencoderKL, DDPMScheduler
+from diffusers import AutoencoderKL
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
@@ -94,8 +91,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="result_fit")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="Number of dataset samples to process. -1 = all.")
-    parser.add_argument("--width", type=int, default=768)
-    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=682)
     parser.add_argument("--num_inference_steps", type=int, default=30)
     parser.add_argument("--guidance_scale", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -104,6 +101,17 @@ def parse_args():
     parser.add_argument("--mixed_precision", type=str, default=None,
                         choices=["no", "fp16", "bf16"])
     return parser.parse_args()
+
+
+def _pad_to_multiple(t: torch.Tensor, multiple: int = 8):
+    """Pad a [B, C, H, W] tensor so H and W are multiples of `multiple`.
+    Returns (padded_tensor, (pad_bottom, pad_right)) so the crop can be undone."""
+    _, _, h, w = t.shape
+    pad_h = (multiple - h % multiple) % multiple
+    pad_w = (multiple - w % multiple) % multiple
+    if pad_h == 0 and pad_w == 0:
+        return t, (0, 0)
+    return torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
 
 
 def _expand_conv_in_13ch(unet):
@@ -282,6 +290,15 @@ def main():
 
     pipe.set_progress_bar_config(disable=False)
 
+    # ── Derive padded dimensions (VAE requires multiples of 8) ───────────────
+    def _align(v: int, m: int = 8) -> int:
+        return v + (m - v % m) % m
+
+    pad_h = _align(args.height) - args.height  # pixels added to bottom
+    pad_w = _align(args.width) - args.width    # pixels added to right
+    pipe_height = args.height + pad_h
+    pipe_width = args.width + pad_w
+
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset = FITDatasetWithMeasurements(
         data_root=args.data_dir,
@@ -350,6 +367,18 @@ def main():
 
             generator = torch.Generator(device).manual_seed(args.seed) if args.seed else None
 
+            # Pad spatial inputs to multiples of 8, then crop outputs back.
+            person_input = (person_images + 1.0) / 2.0
+            if pad_h > 0 or pad_w > 0:
+                person_input, _ = _pad_to_multiple(person_input)
+                pose_imgs_in, _ = _pad_to_multiple(pose_imgs)
+                masks_in, _ = _pad_to_multiple(masks)
+                garment_images_in, _ = _pad_to_multiple(garment_images)
+            else:
+                pose_imgs_in = pose_imgs
+                masks_in = masks
+                garment_images_in = garment_images
+
             images = pipe(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -358,16 +387,22 @@ def main():
                 num_inference_steps=args.num_inference_steps,
                 generator=generator,
                 strength=1.0,
-                pose_img=pose_imgs,
+                pose_img=pose_imgs_in,
                 text_embeds_cloth=prompt_embeds_c,
-                cloth=garment_images,
-                mask_image=masks,
-                image=(person_images + 1.0) / 2.0,
-                height=args.height,
-                width=args.width,
+                cloth=garment_images_in,
+                mask_image=masks_in,
+                image=person_input,
+                height=pipe_height,
+                width=pipe_width,
                 guidance_scale=args.guidance_scale,
                 ip_adapter_image=image_embeds,
             )[0]
+
+            # Crop padding off so saved images match the original resolution.
+            if pad_h > 0 or pad_w > 0:
+                images = [
+                    img.crop((0, 0, args.width, args.height)) for img in images
+                ]
 
         for i, (img, fname) in enumerate(zip(images, person_filenames)):
             stem = os.path.splitext(os.path.basename(fname))[0]

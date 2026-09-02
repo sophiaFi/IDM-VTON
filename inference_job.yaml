@@ -1,0 +1,108 @@
+# Vertex AI CustomJob spec for inference_fit.py.
+#
+# Usage:
+#   gcloud ai custom-jobs create \
+#       --region=us-central1 \
+#       --display-name=idm-vton-inference \
+#       --config=inference_job.yaml
+#
+# Results are uploaded to gs://ma-idm-vton-data/inference_output/.
+#
+# To run with a fine-tuned checkpoint, set CHECKPOINT_PREFIX below and
+# uncomment the checkpoint download + --checkpoint_dir flag.
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
+
+          # CHECKPOINT_PREFIX="checkpoints/checkpoint-200"
+
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          bucket_name = "ma-idm-vton-data"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+                  print(f"  downloaded {blob.name}")
+              print(f"Done: {local_root}  ({len(blobs)} files)")
+
+          download_prefix("datasets/fit-mini/",     "/tmp/fit-mini")
+          download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
+          download_prefix("scripts/",               "/tmp/scripts")
+          # Uncomment for checkpoint mode:
+          # download_prefix("ckpt/ip_adapter/",                          "/tmp/ckpt/ip_adapter")
+          # import os
+          # ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "checkpoints/checkpoint-200") + "/"
+          # download_prefix(ckpt_prefix, "/tmp/checkpoint")
+          PYEOF
+
+          cp /tmp/scripts/inference_fit.py /app/inference_fit.py
+
+          accelerate launch \
+            --num_processes=1 \
+            --num_machines=1 \
+            inference_fit.py \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
+            --data_dir /tmp/fit-mini \
+            --output_dir /tmp/inference_output \
+            --num_samples -1 \
+            --mixed_precision fp16 \
+            --num_inference_steps 30 \
+            --guidance_scale 2.0 \
+            --seed 42
+          # Uncomment for checkpoint mode (add after --seed 42):
+          # --checkpoint_dir /tmp/checkpoint \
+          # --ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+          # --pretrained_garmentnet_path /tmp/yisol-IDM-VTON
+
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          out_dir = pathlib.Path("/tmp/inference_output")
+          if not out_dir.exists():
+              print("WARNING: /tmp/inference_output not found — inference may have failed.", file=sys.stderr)
+              sys.exit(1)
+          bucket = storage.Client().bucket("ma-idm-vton-data")
+          uploaded = 0
+          for f in out_dir.rglob("*"):
+              if f.is_file():
+                  rel = f.relative_to(out_dir)
+                  blob_name = f"inference_output/{rel}".replace("\\", "/")
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  print(f"  uploaded {blob_name}")
+                  uploaded += 1
+          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton-data/inference_output/")
+          PYEOF
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
