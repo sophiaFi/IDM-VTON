@@ -885,27 +885,26 @@ def main():
                         + list(measurement_encoder.parameters())
                     )
                     accelerator.clip_grad_norm_(trainable_params, 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                progress_bar.update(1)
-                global_step += 1
-                if profiling:
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    profile_step_times.append(time.perf_counter() - step_start)
+                    progress_bar.update(1)
+                    global_step += 1
+                    if profiling:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        profile_step_times.append(time.perf_counter() - step_start)
 
-            if accelerator.sync_gradients:
-                snap = _mem_snapshot() if accelerator.is_main_process else {}
-                log_payload = {"train_loss": train_loss, "menc_grad_norm": menc_grad_norm_accum}
-                if args.fit_loss_weight > 0:
-                    log_payload["train_fit_loss"] = train_fit_loss
-                if snap:
-                    log_payload.update({k: v for k, v in snap.items() if "peak" not in k})
-                accelerator.log(log_payload, step=global_step)
-                train_loss = 0.0
-                train_fit_loss = 0.0
-                menc_grad_norm_accum = 0.0
+                    snap = _mem_snapshot() if accelerator.is_main_process else {}
+                    log_payload = {"train_loss": train_loss, "menc_grad_norm": menc_grad_norm_accum}
+                    if args.fit_loss_weight > 0:
+                        log_payload["train_fit_loss"] = train_fit_loss
+                    if snap:
+                        log_payload.update({k: v for k, v in snap.items() if "peak" not in k})
+                    accelerator.log(log_payload, step=global_step)
+                    train_loss = 0.0
+                    train_fit_loss = 0.0
+                    menc_grad_norm_accum = 0.0
 
             if args.memory_log_steps > 0 and global_step % args.memory_log_steps == 0:
                 _log_mem("train-step", global_step)

@@ -19,7 +19,8 @@ RUN pip install --no-cache-dir \
     bitsandbytes==0.39.0 \
     scipy==1.11.1 \
     peft==0.7.1 \
-    huggingface_hub==0.23.4
+    huggingface_hub==0.23.4 \
+    tensorboard==2.14.0
 
 COPY src/ src/
 COPY ip_adapter/ ip_adapter/

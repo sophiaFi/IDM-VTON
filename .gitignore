@@ -1,9 +1,11 @@
 # data
 /data_mini_test
+/data
 
 # outputs
 /result_fit
 /debug_mask
+/tb_logs
 *.png
 *.jpg
 
