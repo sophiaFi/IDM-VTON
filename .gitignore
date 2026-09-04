@@ -6,6 +6,7 @@
 /result_fit
 /debug_mask
 /tb_logs
+/eval_output
 *.png
 *.jpg
 
