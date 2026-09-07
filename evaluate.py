@@ -5,13 +5,13 @@ Usage — compare a result folder against ground truth:
 
     python evaluate.py \\
         --result_dir result_fit \\
-        --data_dir data_mini_test \\
+        --data_dir data/data_mini_test \\
         --output_dir eval_output
 
     # With measurement counterfactual sensitivity test (requires checkpoint):
     python evaluate.py \\
         --result_dir result_fit \\
-        --data_dir data_mini_test \\
+        --data_dir data/data_mini_test \\
         --checkpoint_dir output/checkpoint-500 \\
         --counterfactual \\
         --output_dir eval_output
@@ -191,20 +191,47 @@ def iou_binary(mask_pred: torch.Tensor, mask_gt: torch.Tensor) -> float:
     return inter / (union + 1e-8)
 
 
-def boundary_f1(mask_pred: torch.Tensor, mask_gt: torch.Tensor, dilation: int = 3) -> float:
-    """Approximate boundary F1 via morphological dilation."""
-    import torch.nn.functional as F
-    kernel = torch.ones(1, 1, dilation * 2 + 1, dilation * 2 + 1, device=mask_pred.device)
-    # ensure exactly 4D: [1, 1, H, W]
+def _boundary_maps(
+    mask_pred: torch.Tensor, mask_gt: torch.Tensor, dilation: int = 3
+):
+    """Return (p_boundary, g_boundary, dilated_p_boundary, dilated_g_boundary).
+
+    All tensors are [1,1,H,W] float32.
+
+    Boundary = 1-px contour on the mask edge, extracted as mask minus its erosion.
+    Dilated boundary = boundary fattened by `dilation` px (tolerance band for F1 hits
+    and for visualising near-misses).
+    """
+    erode_kernel = torch.ones(1, 1, 3, 3, device=mask_pred.device)
+    dil_kernel   = torch.ones(1, 1, dilation * 2 + 1, dilation * 2 + 1, device=mask_pred.device)
+
     p = mask_pred.float().view(1, 1, mask_pred.shape[-2], mask_pred.shape[-1])
     g = mask_gt.float().view(1, 1, mask_gt.shape[-2], mask_gt.shape[-1])
-    p_boundary = (F.conv2d(p, kernel, padding=dilation) > 0).float() * (1 - p)
-    g_boundary = (F.conv2d(g, kernel, padding=dilation) > 0).float() * (1 - g)
-    # count boundary pixels of pred that overlap dilated gt boundary and vice-versa
-    p_hits = (p_boundary * (F.conv2d(g, kernel, padding=dilation) > 0).float()).sum().item()
-    g_hits = (g_boundary * (F.conv2d(p, kernel, padding=dilation) > 0).float()).sum().item()
+
+    # 1-px interior boundary: mask minus erosion
+    p_eroded = -F.max_pool2d(-p, kernel_size=3, stride=1, padding=1)
+    g_eroded = -F.max_pool2d(-g, kernel_size=3, stride=1, padding=1)
+    p_boundary = (p - p_eroded).clamp(0, 1)
+    g_boundary = (g - g_eroded).clamp(0, 1)
+
+    # Dilate each boundary for hit-tolerance
+    dilated_p_boundary = (F.conv2d(p_boundary, dil_kernel, padding=dilation) > 0).float()
+    dilated_g_boundary = (F.conv2d(g_boundary, dil_kernel, padding=dilation) > 0).float()
+
+    return p_boundary, g_boundary, dilated_p_boundary, dilated_g_boundary
+
+
+def boundary_f1(mask_pred: torch.Tensor, mask_gt: torch.Tensor, dilation: int = 3) -> float:
+    """Boundary F1: fraction of boundary pixels within `dilation` px of the opposing boundary."""
+    p_boundary, g_boundary, dilated_p_boundary, dilated_g_boundary = _boundary_maps(
+        mask_pred, mask_gt, dilation
+    )
+    # precision: how many pred boundary pixels are near the GT boundary?
+    p_hits = (p_boundary * dilated_g_boundary).sum().item()
+    # recall: how many GT boundary pixels are near the pred boundary?
+    g_hits = (g_boundary * dilated_p_boundary).sum().item()
     precision = p_hits / (p_boundary.sum().item() + 1e-8)
-    recall = g_hits / (g_boundary.sum().item() + 1e-8)
+    recall    = g_hits / (g_boundary.sum().item() + 1e-8)
     return 2 * precision * recall / (precision + recall + 1e-8)
 
 
@@ -212,6 +239,80 @@ def cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
     a = F.normalize(a.flatten().unsqueeze(0), dim=1)
     b = F.normalize(b.flatten().unsqueeze(0), dim=1)
     return (a * b).sum().item()
+
+
+def mask_overlap_image(
+    base_img: Image.Image,
+    pred_mask: torch.Tensor,
+    gt_mask: torch.Tensor,
+    size: tuple,
+) -> Image.Image:
+    """Render TP/FP/FN mask overlap on top of base_img at display size.
+
+    Green = true positive, Red = false positive, Blue = false negative.
+    """
+    img = base_img.resize(size, Image.LANCZOS)
+    base = np.array(img, dtype=np.float32)
+    W, H = size
+
+    def _resize_mask(m: torch.Tensor) -> np.ndarray:
+        m_pil = Image.fromarray((m.squeeze(0).numpy() * 255).astype(np.uint8))
+        return np.array(m_pil.resize((W, H), Image.NEAREST)) > 127
+
+    pred = _resize_mask(pred_mask)
+    gt   = _resize_mask(gt_mask)
+
+    alpha = 0.5
+    overlay = base.copy()
+    tp = pred & gt
+    fp = pred & ~gt
+    fn = ~pred & gt
+    overlay[tp] = overlay[tp] * (1 - alpha) + np.array([0,   200, 0  ], dtype=np.float32) * alpha
+    overlay[fp] = overlay[fp] * (1 - alpha) + np.array([220, 0,   0  ], dtype=np.float32) * alpha
+    overlay[fn] = overlay[fn] * (1 - alpha) + np.array([0,   80,  220], dtype=np.float32) * alpha
+    return Image.fromarray(overlay.clip(0, 255).astype(np.uint8))
+
+
+def boundary_overlap_image(
+    base_img: Image.Image,
+    pred_mask: torch.Tensor,
+    gt_mask: torch.Tensor,
+    size: tuple,
+    dilation: int = 3,
+) -> Image.Image:
+    """Visualise boundary alignment at display size.
+
+    The base image is dimmed to 40 % so coloured boundary lines stand out:
+      Green  — pred boundary pixel within `dilation` px of GT boundary (correct)
+      Red    — pred boundary too far from GT boundary (false edge)
+      Blue   — GT boundary too far from pred boundary (missed edge)
+    """
+    W, H = size
+
+    def _resize_mask(m: torch.Tensor) -> torch.Tensor:
+        m_np = (m.squeeze(0).numpy() * 255).astype(np.uint8)
+        m_pil = Image.fromarray(m_np).resize((W, H), Image.NEAREST)
+        arr = np.array(m_pil, dtype=np.float32) / 255.0
+        return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+
+    p = _resize_mask(pred_mask)
+    g = _resize_mask(gt_mask)
+    p_boundary, g_boundary, dilated_p_boundary, dilated_g_boundary = _boundary_maps(p, g, dilation)
+
+    p_b = p_boundary.squeeze().numpy().astype(bool)
+    g_b = g_boundary.squeeze().numpy().astype(bool)
+    d_p = dilated_p_boundary.squeeze().numpy().astype(bool)
+    d_g = dilated_g_boundary.squeeze().numpy().astype(bool)
+
+    base = np.array(base_img.resize(size, Image.LANCZOS), dtype=np.float32) * 0.4
+    hit  = p_b & d_g          # pred boundary near GT boundary — correct edge
+    miss = p_b & ~d_g         # pred boundary far from GT boundary — false edge
+    skip = g_b & ~d_p         # GT boundary far from pred boundary — missed edge
+
+    base[hit]  = base[hit]  / 0.4 * 0.3 + np.array([0,   210, 60 ], dtype=np.float32) * 0.7
+    base[miss] = base[miss] / 0.4 * 0.3 + np.array([220, 30,  30 ], dtype=np.float32) * 0.7
+    base[skip] = base[skip] / 0.4 * 0.3 + np.array([30,  100, 220], dtype=np.float32) * 0.7
+    return Image.fromarray(base.clip(0, 255).astype(np.uint8))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -354,7 +455,6 @@ def find_pairs(result_dir: str, data_dir: str):
     data_dir = Path(data_dir)
     target_dir = data_dir / "target"
     mask_dir = data_dir / "agnostic-mask"
-    garment_mask_dir = data_dir / "garment-mask"
 
     pairs = []
     for gen_path in sorted(result_dir.glob("*_result.png")):
@@ -373,12 +473,7 @@ def find_pairs(result_dir: str, data_dir: str):
             if cands:
                 mask_path = cands[0]
                 break
-        # GT garment mask
-        gm_path = None
-        cands = list(garment_mask_dir.glob(f"{stem}.*")) if garment_mask_dir.exists() else []
-        if cands:
-            gm_path = cands[0]
-        pairs.append((gen_path, gt_path, mask_path, gm_path, stem))
+        pairs.append((gen_path, gt_path, mask_path, stem))
 
     return pairs
 
@@ -399,7 +494,9 @@ def load_measurements(data_dir: str) -> dict:
 def save_visual(
     gen: Image.Image, gt: Image.Image, sample_id: str,
     cloth: Optional[Image.Image], person: Optional[Image.Image],
-    metrics: dict, out_dir: Path
+    metrics: dict, out_dir: Path,
+    pred_mask: Optional[torch.Tensor] = None,
+    gt_mask: Optional[torch.Tensor] = None,
 ):
     size = (256, 342)
     cols = []
@@ -409,6 +506,9 @@ def save_visual(
         cols.append(("Garment", cloth.resize(size, Image.LANCZOS)))
     cols.append(("Generated", gen.resize(size, Image.LANCZOS)))
     cols.append(("Ground truth", gt.resize(size, Image.LANCZOS)))
+    if pred_mask is not None and gt_mask is not None:
+        cols.append(("Mask overlap", mask_overlap_image(gen, pred_mask, gt_mask, size)))
+        cols.append(("Boundary", boundary_overlap_image(gen, pred_mask, gt_mask, size)))
 
     W, H = size
     header = 20
@@ -419,8 +519,11 @@ def save_visual(
         canvas.paste(img, (i * W, header))
         draw.text((i * W + 4, 2), label, fill=(40, 40, 40))
 
+    priority_keys = ("ssim", "psnr", "lpips", "clip_sim", "garment_iou", "garment_boundary_f1")
+    ordered = [(k, metrics[k]) for k in priority_keys if k in metrics]
+    ordered += [(k, v) for k, v in metrics.items() if k not in priority_keys]
     metric_str = "  ".join(
-        f"{k}={v:.3f}" for k, v in metrics.items()
+        f"{k}={v:.3f}" for k, v in ordered
         if isinstance(v, float) and not np.isnan(v)
     )
     footer_h = 18
@@ -476,6 +579,48 @@ def compute_fid_kid(
         results["kid_std"]  = float("nan")
 
     return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Garment mask metric chart
+# ──────────────────────────────────────────────────────────────────────────────
+
+def save_mask_metrics_chart(per_sample: list, out_dir: Path):
+    """Bar chart of per-sample garment_iou and garment_boundary_f1, saved as mask_metrics.png."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        warnings.warn("matplotlib not available — mask metrics chart skipped.")
+        return
+
+    ids  = [r["sample_id"] for r in per_sample]
+    ious = [r.get("garment_iou", float("nan")) for r in per_sample]
+    f1s  = [r.get("garment_boundary_f1", float("nan")) for r in per_sample]
+
+    valid = [not np.isnan(v) for v in ious]
+    if not any(valid):
+        return
+
+    x = np.arange(len(ids))
+    width = 0.4
+    fig, ax = plt.subplots(figsize=(max(6, len(ids) * 0.6), 4))
+    ax.bar(x - width / 2, ious, width, label="IoU",         color="#4C72B0")
+    ax.bar(x + width / 2, f1s,  width, label="Boundary F1", color="#DD8452")
+    ax.set_xticks(x)
+    ax.set_xticklabels(ids, rotation=45, ha="right", fontsize=8)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("Score")
+    ax.set_title("Garment mask quality per sample")
+    ax.axhline(np.nanmean(ious), color="#4C72B0", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.axhline(np.nanmean(f1s),  color="#DD8452", linestyle="--", linewidth=0.8, alpha=0.7)
+    ax.legend()
+    fig.tight_layout()
+    chart_path = out_dir / "mask_metrics.png"
+    fig.savefig(chart_path, dpi=120)
+    plt.close(fig)
+    print(f"Mask metrics chart → {chart_path}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -747,7 +892,7 @@ def main():
     gen_tensors_for_fid = []
     gt_tensors_for_fid  = []
 
-    for gen_path, gt_path, mask_path, gm_path, sample_id in tqdm(pairs, desc="Per-sample metrics"):
+    for gen_path, gt_path, mask_path, sample_id in tqdm(pairs, desc="Per-sample metrics"):
         gen_img = load_image_rgb(str(gen_path), size=size)
         gt_img  = load_image_rgb(str(gt_path),  size=size)
 
@@ -784,19 +929,21 @@ def main():
         )
         row["garment_lpips"] = compute_lpips(gen_garment, gt_garment, device)
 
-        # ── Garment mask IoU (from GT mask file or SegFormer) ──────────────────
-        if gm_path is not None:
-            gt_gm_pil   = Image.open(str(gm_path)).convert("L").resize(size, Image.NEAREST)
-            gt_gm_mask  = mask_to_binary(gt_gm_pil)
-            pred_gm_mask = segment_garment_mask(gen_img, device)
-            if pred_gm_mask is not None and gt_gm_mask is not None:
-                row["garment_iou"]        = iou_binary(pred_gm_mask, gt_gm_mask)
-                row["garment_boundary_f1"] = boundary_f1(pred_gm_mask, gt_gm_mask)
-            else:
-                row["garment_iou"]        = float("nan")
-                row["garment_boundary_f1"] = float("nan")
+        # ── Garment mask IoU ───────────────────────────────────────────────────
+        # Both masks come from the same SegFormer so the metric is symmetric:
+        # IoU = 1 when gen == GT, regardless of what disk annotation files contain.
+        # The disk mask (gm_path) is ignored for the primary metric.
+        pred_gm_mask_for_vis = None
+        gt_gm_mask_for_vis   = None
+        pred_gm_mask = segment_garment_mask(gen_img, device)
+        gt_gm_mask   = segment_garment_mask(gt_img,  device)
+        if pred_gm_mask is not None and gt_gm_mask is not None:
+            row["garment_iou"]         = iou_binary(pred_gm_mask, gt_gm_mask)
+            row["garment_boundary_f1"] = boundary_f1(pred_gm_mask, gt_gm_mask)
+            pred_gm_mask_for_vis = pred_gm_mask.cpu()
+            gt_gm_mask_for_vis   = gt_gm_mask.cpu()
         else:
-            row["garment_iou"]        = float("nan")
+            row["garment_iou"]         = float("nan")
             row["garment_boundary_f1"] = float("nan")
 
         # ── CLIP similarity ────────────────────────────────────────────────────
@@ -812,12 +959,19 @@ def main():
             cloth_img  = load_image_rgb(str(cloth_path_cands[0]),  size=size) if cloth_path_cands  else None
             person_img = load_image_rgb(str(person_path_cands[0]), size=size) if person_path_cands else None
             visual_metrics = {
-                k: row[k] for k in ("ssim", "psnr", "lpips", "clip_sim")
+                k: row[k] for k in ("ssim", "psnr", "lpips", "clip_sim", "garment_iou", "garment_boundary_f1")
                 if k in row and isinstance(row[k], float)
             }
-            save_visual(gen_img, gt_img, sample_id, cloth_img, person_img, visual_metrics, vis_dir)
+            save_visual(
+                gen_img, gt_img, sample_id, cloth_img, person_img, visual_metrics, vis_dir,
+                pred_mask=pred_gm_mask_for_vis, gt_mask=gt_gm_mask_for_vis,
+            )
 
         per_sample.append(row)
+
+    # ── Garment mask metrics chart ─────────────────────────────────────────────
+    if not args.no_visuals:
+        save_mask_metrics_chart(per_sample, out_dir)
 
     # ── FID / KID ──────────────────────────────────────────────────────────────
     print("Computing FID / KID …")

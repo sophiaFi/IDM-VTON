@@ -220,13 +220,17 @@ def _boundary_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     Extracts boundaries via max-pool minus erosion (a morphological gradient), then
     penalises the L1 distance between the two boundary maps.  This pushes the model
     to align mask edges, not just their interior overlap.
+
+    Normalized by the number of GT boundary pixels (not total pixel count) so the
+    loss is O(1) when boundaries are fully misaligned — comparable to the IoU loss
+    and therefore actually responsive to boundary_weight.
     """
-    # max-pool(x) - min-pool(x) approximates the morphological gradient (boundary ring)
     pool = torch.nn.functional.max_pool2d
     erode = lambda x: -torch.nn.functional.max_pool2d(-x, kernel_size=3, stride=1, padding=1)
     boundary_pred = pool(pred, kernel_size=3, stride=1, padding=1) - erode(pred)
     boundary_gt   = pool(gt,   kernel_size=3, stride=1, padding=1) - erode(gt)
-    return torch.nn.functional.l1_loss(boundary_pred, boundary_gt)
+    n_boundary = (boundary_gt > 0.1).float().sum().clamp(min=1.0)
+    return (boundary_pred - boundary_gt).abs().sum() / n_boundary
 
 
 def _compute_fit_loss(
