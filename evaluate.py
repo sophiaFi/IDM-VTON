@@ -52,22 +52,40 @@ Side-by-side comparison images are written to <output_dir>/visuals/.
 """
 
 import argparse
+import inspect
 import json
 import os
 import sys
-import warnings
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import timm
 import torch
+import torch.nn.functional as F
+from PIL import Image
+from skimage.metrics import structural_similarity
+from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
+from torchmetrics.image import PeakSignalNoiseRatio as PSNR
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
+from torchmetrics.image.fid import FrechetInceptionDistance as FID
+from torchmetrics.image.kid import KernelInceptionDistance as KID
+from transformers import (
+    CLIPModel,
+    CLIPProcessor,
+    SegformerForSemanticSegmentation,
+    SegformerImageProcessor,
+)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 # peft==0.6.0 LoraConfig doesn't accept kwargs added in later versions
 # (e.g. loftq_config).  Patch __init__ to drop unknown keyword arguments.
 try:
     from peft import LoraConfig as _LoraConfig
-    import inspect as _inspect
-    _lora_known = set(_inspect.signature(_LoraConfig.__init__).parameters)
+    _lora_known = set(inspect.signature(_LoraConfig.__init__).parameters)
     _lora_orig_init = _LoraConfig.__init__
 
     def _lora_permissive_init(self, *args, **kwargs):
@@ -77,58 +95,6 @@ try:
     _LoraConfig.__init__ = _lora_permissive_init
 except Exception:
     pass
-import torch.nn.functional as F
-from PIL import Image
-from tqdm import tqdm
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Optional imports: warn but don't crash if not available
-# ──────────────────────────────────────────────────────────────────────────────
-
-try:
-    from torchmetrics.image import StructuralSimilarityIndexMeasure as SSIM
-    from torchmetrics.image import PeakSignalNoiseRatio as PSNR
-    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity as LPIPS
-    from torchmetrics.image.fid import FrechetInceptionDistance as FID
-    from torchmetrics.image.kid import KernelInceptionDistance as KID
-    HAS_TORCHMETRICS = True
-except ImportError:
-    HAS_TORCHMETRICS = False
-    warnings.warn("torchmetrics not available — SSIM, PSNR, LPIPS, FID, KID skipped.")
-
-try:
-    import transformers
-    from transformers import CLIPProcessor, CLIPModel
-    HAS_CLIP = True
-except ImportError:
-    HAS_CLIP = False
-    warnings.warn("transformers not available — CLIP similarity skipped.")
-
-try:
-    import timm
-    HAS_DINO = True
-except ImportError:
-    HAS_DINO = False
-    warnings.warn("timm not available — DINO similarity skipped.")
-
-try:
-    from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
-    HAS_SEGFORMER = True
-except ImportError:
-    HAS_SEGFORMER = False
-    warnings.warn("transformers SegFormer not available — garment segmentation skipped.")
-
-try:
-    import insightface
-    HAS_INSIGHTFACE = True
-except ImportError:
-    HAS_INSIGHTFACE = False
-
-try:
-    from skimage.metrics import structural_similarity
-    HAS_SKIMAGE = True
-except ImportError:
-    HAS_SKIMAGE = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -172,9 +138,7 @@ def apply_mask_inside(img_t: torch.Tensor, mask_t: torch.Tensor) -> torch.Tensor
 
 def ssim_numpy(img1: np.ndarray, img2: np.ndarray) -> float:
     """SSIM via skimage; input: HWC uint8."""
-    if HAS_SKIMAGE:
-        return structural_similarity(img1, img2, channel_axis=2, data_range=255)
-    return float("nan")
+    return structural_similarity(img1, img2, channel_axis=2, data_range=255)
 
 
 def psnr_numpy(img1: np.ndarray, img2: np.ndarray) -> float:
@@ -324,7 +288,7 @@ _clip_proc = None
 
 def get_clip(device):
     global _clip_model, _clip_proc
-    if _clip_model is None and HAS_CLIP:
+    if _clip_model is None:
         _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device).eval()
         _clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
     return _clip_model, _clip_proc
@@ -334,7 +298,7 @@ _dino_model = None
 
 def get_dino(device):
     global _dino_model
-    if _dino_model is None and HAS_DINO:
+    if _dino_model is None:
         _dino_model = timm.create_model("vit_small_patch8_224.dino", pretrained=True).to(device).eval()
     return _dino_model
 
@@ -345,7 +309,7 @@ _GARMENT_LABEL_IDS = None
 
 def get_segformer(device):
     global _segformer_model, _segformer_proc, _GARMENT_LABEL_IDS
-    if _segformer_model is None and HAS_SEGFORMER:
+    if _segformer_model is None:
         _segformer_proc = SegformerImageProcessor.from_pretrained(
             "mattmdjaga/segformer_b2_clothes"
         )
@@ -362,7 +326,7 @@ _lpips_metric = None
 
 def get_lpips(device):
     global _lpips_metric
-    if _lpips_metric is None and HAS_TORCHMETRICS:
+    if _lpips_metric is None:
         _lpips_metric = LPIPS(net_type="vgg").to(device)
     return _lpips_metric
 
@@ -374,19 +338,14 @@ def get_lpips(device):
 @torch.no_grad()
 def compute_lpips(gen_t: torch.Tensor, gt_t: torch.Tensor, device) -> float:
     """LPIPS between two [C,H,W] float32 [0,1] tensors."""
-    metric = get_lpips(device)
-    if metric is None:
-        return float("nan")
     g = gen_t.unsqueeze(0).to(device) * 2 - 1
     t = gt_t.unsqueeze(0).to(device) * 2 - 1
-    return metric(g, t).item()
+    return get_lpips(device)(g, t).item()
 
 
 @torch.no_grad()
 def compute_clip_sim(gen_img: Image.Image, gt_img: Image.Image, device) -> float:
     model, proc = get_clip(device)
-    if model is None:
-        return float("nan")
     inputs = proc(images=[gen_img, gt_img], return_tensors="pt", padding=True)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     feats = model.get_image_features(**inputs)
@@ -400,9 +359,6 @@ def compute_dino_sim(
 ) -> float:
     """DINO cosine similarity on the background (non-garment) region."""
     model = get_dino(device)
-    if model is None:
-        return float("nan")
-    bg_mask = (1.0 - mask_t).to(device)
     gen_bg = (apply_mask_outside(gen_t.to(device), mask_t.to(device)))
     gt_bg  = (apply_mask_outside(gt_t.to(device), mask_t.to(device)))
     size = (224, 224)
@@ -427,8 +383,6 @@ def compute_dino_sim(
 def segment_garment_mask(img_pil: Image.Image, device) -> torch.Tensor:
     """Run SegFormer and return a binary garment mask as [1, H, W] float32."""
     model, proc, label_ids = get_segformer(device)
-    if model is None:
-        return None
     inputs = proc(images=img_pil, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
     logits = model(**inputs).logits
@@ -545,7 +499,7 @@ def compute_fid_kid(
 ) -> dict:
     """Compute FID and KID from lists of [C,H,W] float32 [0,1] tensors."""
     results = {}
-    if not HAS_TORCHMETRICS or len(gen_tensors) < 2:
+    if len(gen_tensors) < 2:
         return {"fid": float("nan"), "kid_mean": float("nan"), "kid_std": float("nan")}
 
     def to_uint8_resized(tensors, size=(299, 299)):
@@ -587,14 +541,6 @@ def compute_fid_kid(
 
 def save_mask_metrics_chart(per_sample: list, out_dir: Path):
     """Bar chart of per-sample garment_iou and garment_boundary_f1, saved as mask_metrics.png."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        warnings.warn("matplotlib not available — mask metrics chart skipped.")
-        return
-
     ids  = [r["sample_id"] for r in per_sample]
     ious = [r.get("garment_iou", float("nan")) for r in per_sample]
     f1s  = [r.get("garment_boundary_f1", float("nan")) for r in per_sample]
