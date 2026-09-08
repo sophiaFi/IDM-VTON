@@ -116,25 +116,25 @@ def normalize_measurements(measurements_dict):
     Returns:
         torch.Tensor [7]: normalized measurements
     """
-    # Constants for normalization (calculated from FIT dataset statistics)
+    # Constants for normalization (calculated from FIT dataset train split statistics in cm)
     MEAN = torch.tensor([
-        105.534,  # body_bust (cm)
-        171.581, # body_height (cm)
-        107.012,  # body_hips (cm)
-        92.043,  # body_waist (cm)
-        115.716,  # garment_bust (cm)
-        53.553,  # garment_length (cm)
-        29.687,  # garment_sleeve_length (cm)
+        105.118,  # body_bust
+        172.126,  # body_height
+        106.641,  # body_hips
+        91.401,  # body_waist
+        114.514,  # garment_bust
+        53.868,  # garment_length
+        30.192,  # garment_sleeve_length
     ])
-    
+
     STD = torch.tensor([
-        11.761,  # body_bust
-        9.497,  # body_height
-        10.762,  # body_hips
-        15.063,  # body_waist
-        13.396,  # garment_bust
-        9.575,  # garment_length
-        17.973,  # garment_sleeve_length
+        10.726,  # body_bust
+        8.791,  # body_height
+        9.568,  # body_hips
+        13.970,  # body_waist
+        13.072,  # garment_bust
+        8.594,  # garment_length
+        18.197,  # garment_sleeve_length
     ])
     
     # Extract measurements
