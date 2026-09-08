@@ -3,11 +3,11 @@ steps:
     args:
       - build
       - -t
-      - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+      - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
       - .
 
 images:
-  - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+  - us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
 
 options:
   machineType: E2_HIGHCPU_8
