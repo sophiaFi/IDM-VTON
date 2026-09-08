@@ -13,12 +13,12 @@ Steps (all idempotent — already-computed outputs are skipped):
      "garment_caption" on each record.
 
 Run from the repo root:
-    python preprocess_fit.py --data_root data_mini_test [--captions-only] [--expand-mask] [--device cuda]
+    python preprocess_fit.py --data_root data/data_mini_test [--captions-only] [--expand-mask] [--device cuda]
 
 Upload results to Google Cloud (e.g. agnostic masks, densepose, garment masks):
-gsutil -m rsync -r data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
-gsutil -m rsync -r data_mini_test/image-densepose/ gs://ma-idm-vton-data/datasets/fit-mini/image-densepose/
-gsutil -m rsync -r data_mini_test/garment-mask/ gs://ma-idm-vton-data/datasets/fit-mini/garment-mask/
+gsutil -m rsync -r data/data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
+gsutil -m rsync -r data/data_mini_test/image-densepose/ gs://ma-idm-vton-data/datasets/fit-mini/image-densepose/
+gsutil -m rsync -r data/data_mini_test/garment-mask/ gs://ma-idm-vton-data/datasets/fit-mini/garment-mask/
 
 """
 

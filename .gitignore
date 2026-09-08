@@ -1,6 +1,6 @@
 # data
-/data_mini_test
-/data
+/data/data_mini_test
+/data/hpo
 
 # outputs
 /result_fit

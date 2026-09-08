@@ -17,11 +17,11 @@ Two modes:
     positive and negative prompt paths (zero token for negative/CFG).
 
 Example (quick single-sample test, no checkpoint):
-    python inference_fit.py --data_dir data_mini_test --num_samples 1
+    python inference_fit.py --data_dir data/data_mini_test --num_samples 1
 
 Example (after training):
     python inference_fit.py \
-        --data_dir data_mini_test \
+        --data_dir data/data_mini_test \
         --checkpoint_dir output/checkpoint-500 \
         --pretrained_model_name_or_path diffusers/stable-diffusion-xl-1.0-inpainting-0.1 \
         --pretrained_garmentnet_path stabilityai/stable-diffusion-xl-base-1.0 \
@@ -87,7 +87,7 @@ def parse_args():
         "--image_encoder_path", type=str, default="ckpt/image_encoder",
         help="Path to the CLIP image encoder. Only needed when --checkpoint_dir is set.",
     )
-    parser.add_argument("--data_dir", type=str, default="data_mini_test")
+    parser.add_argument("--data_dir", type=str, default="data/data_mini_test")
     parser.add_argument("--output_dir", type=str, default="result_fit")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="Number of dataset samples to process. -1 = all.")

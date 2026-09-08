@@ -15,7 +15,7 @@ A five-panel row is saved per sample:
 A row info banner above each row shows id, bust_ratio, length_ratio, px_per_cm.
 
 Usage:
-    python test_expand_mask_new.py [--data_root data_mini_test] [--n 4] [--device cuda]
+    python test_expand_mask_new.py [--data_root data/data_mini_test] [--n 4] [--device cuda]
 """
 
 import argparse
@@ -376,7 +376,7 @@ def _legend_strip(canvas_w: int) -> Image.Image:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", default="data_mini_test")
+    parser.add_argument("--data_root", default="data/data_mini_test")
     parser.add_argument("--n", type=int, default=4, help="Number of samples to visualise")
     parser.add_argument("--out", default="test_expand_mask_new_output.png")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")

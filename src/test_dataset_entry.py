@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 from fit_dataset import FITDatasetWithMeasurements
 
 
-DATA_ROOT = "../data_mini_test"
+DATA_ROOT = "../data/data_mini_test"
 
 
 dataset = FITDatasetWithMeasurements(
