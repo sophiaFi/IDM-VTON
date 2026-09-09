@@ -18,7 +18,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
       command:
         - /bin/bash
         - -c

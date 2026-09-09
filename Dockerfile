@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir \
 COPY src/ src/
 COPY ip_adapter/ ip_adapter/
 COPY train_with_measurements.py .
+COPY train_hpo.py .
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/huggingface
