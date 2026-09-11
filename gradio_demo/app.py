@@ -64,35 +64,33 @@ def pil_to_binary_mask(pil_image, threshold=0):
 
 # ---------------------------------------------------------------------------
 # Model loading
+# Load each model directly onto the GPU to avoid staging everything in CPU RAM.
+# On Colab free tier (12 GB RAM, 15 GB VRAM) loading to CPU first would OOM;
+# map_location=device moves each model's weights straight to VRAM as it's read.
 # ---------------------------------------------------------------------------
 base_path = "yisol/IDM-VTON"
 example_path = os.path.join(os.path.dirname(__file__), "example")
 
-print("Loading base model weights...")
-unet = UNet2DConditionModel.from_pretrained(
-    base_path,
-    subfolder="unet",
-    torch_dtype=torch.float16,
-)
-unet.requires_grad_(False)
+def _load(cls, *args, **kwargs):
+    """Load a model and immediately move it to the target device."""
+    model = cls.from_pretrained(*args, torch_dtype=torch.float16, **kwargs)
+    model.to(device)
+    model.requires_grad_(False)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return model
 
-tokenizer_one = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer", use_fast=False)
-tokenizer_two = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer_2", use_fast=False)
+print("Loading base model weights (directly to GPU)...")
+unet            = _load(UNet2DConditionModel,            base_path, subfolder="unet")
+text_encoder_one= _load(CLIPTextModel,                   base_path, subfolder="text_encoder")
+text_encoder_two= _load(CLIPTextModelWithProjection,     base_path, subfolder="text_encoder_2")
+image_encoder   = _load(CLIPVisionModelWithProjection,   base_path, subfolder="image_encoder")
+vae             = _load(AutoencoderKL,                   base_path, subfolder="vae")
+UNet_Encoder    = _load(UNet2DConditionModel_ref,        base_path, subfolder="unet_encoder")
+
+tokenizer_one   = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer",   use_fast=False)
+tokenizer_two   = AutoTokenizer.from_pretrained(base_path, subfolder="tokenizer_2", use_fast=False)
 noise_scheduler = DDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
-
-text_encoder_one = CLIPTextModel.from_pretrained(
-    base_path, subfolder="text_encoder", torch_dtype=torch.float16
-)
-text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-    base_path, subfolder="text_encoder_2", torch_dtype=torch.float16
-)
-image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-    base_path, subfolder="image_encoder", torch_dtype=torch.float16
-)
-vae = AutoencoderKL.from_pretrained(base_path, subfolder="vae", torch_dtype=torch.float16)
-UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
-    base_path, subfolder="unet_encoder", torch_dtype=torch.float16
-)
 
 # ---------------------------------------------------------------------------
 # Load fine-tuned checkpoint (LoRA + conv_in + MeasurementEncoder)
@@ -110,12 +108,16 @@ if args_cli.checkpoint_dir is not None:
     ckpt = args_cli.checkpoint_dir
     print(f"Loading checkpoint from {ckpt} ...")
 
-    # LoRA adapters
+    # LoRA adapters — merge into CPU copy then move to GPU
     lora_path = os.path.join(ckpt, "lora")
     if os.path.isdir(lora_path):
         from peft import PeftModel
+        unet.to("cpu")
         unet = PeftModel.from_pretrained(unet, lora_path)
         unet = unet.merge_and_unload()
+        unet.to(device)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         print("  LoRA weights merged.")
     else:
         print(f"  WARNING: no lora/ folder found in {ckpt}, skipping LoRA.")
@@ -123,7 +125,6 @@ if args_cli.checkpoint_dir is not None:
     # Expanded conv_in weights (9→13 channels)
     conv_in_path = os.path.join(ckpt, "conv_in.pt")
     if os.path.isfile(conv_in_path):
-        # Expand conv_in to 13 channels if still at 9
         if unet.conv_in.in_channels == 9:
             conv_new = torch.nn.Conv2d(
                 in_channels=13,
@@ -135,7 +136,7 @@ if args_cli.checkpoint_dir is not None:
             conv_new.weight.data[:, :9] = unet.conv_in.weight.data
             conv_new.bias.data = unet.conv_in.bias.data
             unet.conv_in = conv_new
-        unet.conv_in.load_state_dict(torch.load(conv_in_path, map_location="cpu"))
+        unet.conv_in.load_state_dict(torch.load(conv_in_path, map_location=device))
         print("  conv_in weights loaded.")
     else:
         print(f"  WARNING: no conv_in.pt found in {ckpt}, skipping.")
@@ -205,9 +206,9 @@ def start_tryon(
     garment_length,
     garment_sleeve_length,
 ):
+    # Models are already on device from startup; move only the preprocessing
+    # models that were created before device placement was established.
     openpose_model.preprocessor.body_estimation.model.to(device)
-    pipe.to(device)
-    pipe.unet_encoder.to(device)
     measurement_encoder.to(device)
 
     garm_img = garm_img.convert("RGB").resize((768, 1024))
