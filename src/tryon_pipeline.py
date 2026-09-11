@@ -1295,6 +1295,7 @@ class StableDiffusionXLInpaintPipeline(
         negative_aesthetic_score: float = 2.5,
         clip_skip: Optional[int] = None,
         pooled_prompt_embeds_c=None,
+        measurement_tokens: Optional[torch.FloatTensor] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         **kwargs,
@@ -1716,6 +1717,13 @@ class StableDiffusionXLInpaintPipeline(
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
         add_time_ids = add_time_ids.to(device)
+
+        if measurement_tokens is not None:
+            # Replicate token for CFG: [B,1,2048] -> [2B,1,2048] (uncond + cond)
+            meas = measurement_tokens.to(device=device, dtype=prompt_embeds.dtype)
+            if self.do_classifier_free_guidance:
+                meas = torch.cat([torch.zeros_like(meas), meas], dim=0)
+            prompt_embeds = torch.cat([prompt_embeds, meas], dim=1)
 
         if ip_adapter_image is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
