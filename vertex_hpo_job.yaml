@@ -76,7 +76,7 @@ workerPoolSpecs:
             --width 384 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
-            --n_trials 2 \
+            --n_trials 30 \
             --max_proxy_steps 1000 \
             --pruner_min_resource 200 \
             --val_batches 20 \
