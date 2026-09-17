@@ -116,6 +116,8 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
     parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--lr_scheduler_type", type=str, default="constant", choices=["constant", "cosine"],
+                        help="LR scheduler: 'constant' keeps LR fixed, 'cosine' anneals to 0 over training.")
     parser.add_argument("--snr_gamma", type=float, default=None)
     parser.add_argument("--noise_offset", type=float, default=None)
     parser.add_argument("--measurement_dropout", type=float, default=0.1)
@@ -565,6 +567,13 @@ def main():
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
+    if args.lr_scheduler_type == "cosine":
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.max_train_steps
+        )
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+
     # ── Accelerator prepare ───────────────────────────────────────────────────
     (
         unet,
@@ -890,6 +899,7 @@ def main():
                     )
                     accelerator.clip_grad_norm_(trainable_params, 1.0)
                     optimizer.step()
+                    lr_scheduler.step()
                     optimizer.zero_grad()
 
                     progress_bar.update(1)
