@@ -10,11 +10,16 @@ Two modes:
     baseline before any fine-tuning.
 
   With --checkpoint_dir <path>:
-    Loads the base model specified by --pretrained_model_name_or_path, expands
-    conv_in to 13 channels, then overlays LoRA + conv_in + MeasurementEncoder
-    weights from the checkpoint. Measurement tokens are appended to the
-    cross-attention sequence ([B, 77, 2048] → [B, 78, 2048]) for both the
-    positive and negative prompt paths (zero token for negative/CFG).
+    Loads the base model specified by --pretrained_model_name_or_path (must be
+    the SAME base used during training, default yisol/IDM-VTON), then overlays
+    LoRA + conv_in + MeasurementEncoder weights from the checkpoint. Measurement
+    tokens are appended to the cross-attention sequence
+    ([B, 77, 2048] → [B, 78, 2048]) for positive prompt; zero token for negative/CFG.
+
+    IMPORTANT: --pretrained_model_name_or_path must match the training base model.
+    Training uses yisol/IDM-VTON (13-channel UNet). Using a different base
+    (e.g. diffusers/stable-diffusion-xl-1.0-inpainting-0.1) will corrupt outputs
+    because LoRA deltas are additive offsets on top of the training base weights.
 
 Example (quick single-sample test, no checkpoint):
     python inference_fit.py --data_dir data/data_mini_test --num_samples 1
@@ -23,8 +28,6 @@ Example (after training):
     python inference_fit.py \
         --data_dir data/data_mini_test \
         --checkpoint_dir output/checkpoint-500 \
-        --pretrained_model_name_or_path diffusers/stable-diffusion-xl-1.0-inpainting-0.1 \
-        --pretrained_garmentnet_path stabilityai/stable-diffusion-xl-base-1.0 \
         --output_dir result_fit \
         --num_samples 4
 """
@@ -58,18 +61,18 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path", type=str, default="yisol/IDM-VTON",
         help=(
-            "Pretrained model. Default (yisol/IDM-VTON) is used when running without a "
-            "checkpoint. When --checkpoint_dir is set, use the same base model that was "
-            "used during training (e.g. diffusers/stable-diffusion-xl-1.0-inpainting-0.1)."
+            "Pretrained model. Must be the same base model used during training. "
+            "Training uses yisol/IDM-VTON by default, so inference should too. "
+            "The LoRA deltas are additive offsets on top of these weights — using a "
+            "different base (e.g. diffusers/stable-diffusion-xl-1.0-inpainting-0.1) "
+            "will produce corrupted results."
         ),
     )
     parser.add_argument(
         "--pretrained_garmentnet_path", type=str, default=None,
         help=(
             "GarmentNet base. Defaults to --pretrained_model_name_or_path with "
-            "subfolder 'unet_encoder' (works for yisol/IDM-VTON). When using a raw "
-            "SDXL base with a checkpoint, set this to "
-            "stabilityai/stable-diffusion-xl-base-1.0."
+            "subfolder 'unet_encoder' (correct for yisol/IDM-VTON)."
         ),
     )
     parser.add_argument(
@@ -84,7 +87,7 @@ def parse_args():
         help="Path to the IP-Adapter weights. Only needed when --checkpoint_dir is set.",
     )
     parser.add_argument(
-        "--image_encoder_path", type=str, default="ckpt/image_encoder",
+        "--image_encoder_path", type=str, default=None,
         help="Path to the CLIP image encoder. Only needed when --checkpoint_dir is set.",
     )
     parser.add_argument("--data_dir", type=str, default="data/data_mini_test")
@@ -186,7 +189,10 @@ def main():
         # ── Checkpoint mode ───────────────────────────────────────────────────
         from peft import PeftModel
 
-        garmentnet_path = args.pretrained_garmentnet_path or "stabilityai/stable-diffusion-xl-base-1.0"
+        # GarmentNet: yisol/IDM-VTON stores it under unet_encoder/; a custom path
+        # uses the unet/ subfolder of that path.
+        garmentnet_path = args.pretrained_garmentnet_path or args.pretrained_model_name_or_path
+        garmentnet_subfolder = "unet" if args.pretrained_garmentnet_path else "unet_encoder"
 
         tokenizer = AutoTokenizer.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False,
@@ -202,14 +208,22 @@ def main():
         ).to(device, dtype=weight_dtype)
         vae = AutoencoderKL.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="vae",
-            torch_dtype=torch.float16,
+            torch_dtype=weight_dtype,
         ).to(device)
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            args.image_encoder_path,
-        ).to(device, dtype=weight_dtype)
+
+        # Image encoder: yisol/IDM-VTON has it under image_encoder/; fall back to
+        # the external ckpt path when supplied.
+        if args.image_encoder_path:
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                args.image_encoder_path,
+            ).to(device, dtype=weight_dtype)
+        else:
+            image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="image_encoder",
+            ).to(device, dtype=weight_dtype)
 
         unet_encoder = UNet2DConditionModel_ref.from_pretrained(
-            garmentnet_path, subfolder="unet",
+            garmentnet_path, subfolder=garmentnet_subfolder,
         ).to(device, dtype=weight_dtype)
         unet_encoder.config.addition_embed_type = None
         unet_encoder.config["addition_embed_type"] = None
@@ -219,13 +233,11 @@ def main():
             args.pretrained_model_name_or_path, subfolder="unet",
             low_cpu_mem_usage=False, device_map=None,
         )
-        unet.config.encoder_hid_dim = image_encoder.config.hidden_size
-        unet.config.encoder_hid_dim_type = "ip_image_proj"
-        unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
-        unet.config["encoder_hid_dim_type"] = "ip_image_proj"
-
-        # IP-Adapter weights
-        state_dict = torch.load(args.ip_adapter_path, map_location="cpu")
+        # IP-Adapter weights: yisol/IDM-VTON bundles them; fall back to external path.
+        ip_bin = args.ip_adapter_path or os.path.join(
+            args.pretrained_model_name_or_path, "ip_adapter", "ip-adapter-plus_sdxl_vit-h.bin"
+        )
+        state_dict = torch.load(ip_bin, map_location="cpu")
         adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
         adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
 
@@ -242,8 +254,10 @@ def main():
         image_proj_model.load_state_dict(state_dict["image_proj"], strict=True)
         unet.encoder_hid_proj = image_proj_model
 
-        # Expand conv_in 9 → 13
-        unet = _expand_conv_in_13ch(unet)
+        # Only expand conv_in if starting from a raw 9-channel SDXL base.
+        # yisol/IDM-VTON already has 13 channels, matching how training was done.
+        if unet.conv_in.in_channels == 9:
+            unet = _expand_conv_in_13ch(unet)
 
         # Load LoRA adapter
         unet = PeftModel.from_pretrained(unet, os.path.join(args.checkpoint_dir, "lora"))

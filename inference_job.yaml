@@ -27,8 +27,6 @@ workerPoolSpecs:
 
           pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
 
-          # CHECKPOINT_PREFIX="checkpoints/checkpoint-200"
-
           python - <<'PYEOF'
           from google.cloud import storage
           import pathlib, sys
@@ -52,14 +50,14 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/fit-mini/",     "/tmp/fit-mini")
+          download_prefix("datasets/top_3/test/",     "/tmp/top_3/test")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts/",               "/tmp/scripts")
-          # Uncomment for checkpoint mode:
-          # download_prefix("ckpt/ip_adapter/",                          "/tmp/ckpt/ip_adapter")
-          # import os
-          # ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "checkpoints/checkpoint-200") + "/"
-          # download_prefix(ckpt_prefix, "/tmp/checkpoint")
+          download_prefix("ckpt/ip_adapter/",     "/tmp/ckpt/ip_adapter")
+          #download_prefix("ckpt/image_encoder/", "/tmp/ckpt/image_encoder")
+          import os
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_1/checkpoint-15000") + "/"
+          download_prefix(ckpt_prefix, "/tmp/checkpoint")
           PYEOF
 
           cp /tmp/scripts/inference_fit.py /app/inference_fit.py
@@ -69,17 +67,17 @@ workerPoolSpecs:
             --num_machines=1 \
             inference_fit.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/fit-mini \
+            --data_dir /tmp/top_3/test \
             --output_dir /tmp/inference_output \
-            --num_samples -1 \
+            --num_samples 5 \
             --mixed_precision fp16 \
             --num_inference_steps 30 \
             --guidance_scale 2.0 \
-            --seed 42
-          # Uncomment for checkpoint mode (add after --seed 42):
-          # --checkpoint_dir /tmp/checkpoint \
-          # --ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-          # --pretrained_garmentnet_path /tmp/yisol-IDM-VTON
+            --seed 42 \
+            --checkpoint_dir /tmp/checkpoint \
+            --ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            #--pretrained_garmentnet_path /tmp/yisol-IDM-VTON \
+            #--image_encoder_path /tmp/ckpt/image_encoder
 
           python - <<'PYEOF'
           from google.cloud import storage
