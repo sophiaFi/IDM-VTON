@@ -5,7 +5,8 @@ FIT Dataset with Body and Garment Measurements for IDM-VTON training.
 import json
 import os
 import random
-from typing import Literal, Tuple
+import sys
+from typing import Callable, Literal, Optional, Tuple
 
 import torch
 import torch.utils.data as data
@@ -16,6 +17,15 @@ from PIL import Image
 from transformers import CLIPImageProcessor
 
 from src.measurement_encoder import normalize_measurements
+
+# utils_mask lives in gradio_demo/; add it to the path when needed for inference.
+def _import_get_mask_location():
+    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _gradio_demo = os.path.join(_repo_root, "gradio_demo")
+    if _gradio_demo not in sys.path:
+        sys.path.insert(0, _gradio_demo)
+    from utils_mask import get_mask_location
+    return get_mask_location
 
 
 class FITDatasetWithMeasurements(data.Dataset):
@@ -72,19 +82,33 @@ class FITDatasetWithMeasurements(data.Dataset):
     def __init__(
         self,
         data_root: str,
-        phase: Literal["train", "test"] = "train",
+        phase: Literal["train", "test", "inference"] = "train",
         size: Tuple[int, int] = (512, 682),
+        parsing_model=None,
+        openpose_model=None,
+        densepose_fn: Optional[Callable] = None,
+        garment_category: str = "upper_body",
     ):
         """
         Args:
-            data_root: Path to the fit-mini dataset root.
-            phase:     "train" enables augmentations; "test" disables them.
-            size:      (height, width) of loaded images.
+            data_root:        Path to the fit-mini dataset root.
+            phase:            "train" enables augmentations; "test" disables them.
+            size:             (height, width) of loaded images.
+            parsing_model:    Parsing instance (required for inference phase).
+            openpose_model:   OpenPose instance (required for inference phase).
+            densepose_fn:     Callable (PIL RGB image) -> PIL RGB densepose map,
+                              same resolution as the input (required for inference).
+            garment_category: Passed to get_mask_location for agnostic mask
+                              generation during inference (default: upper_body).
         """
         super().__init__()
         self.data_root = data_root
         self.phase = phase
         self.height, self.width = size
+        self.parsing_model = parsing_model
+        self.openpose_model = openpose_model
+        self.densepose_fn = densepose_fn
+        self.garment_category = garment_category
 
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -113,33 +137,65 @@ class FITDatasetWithMeasurements(data.Dataset):
             os.path.join(self.data_root, cloth_name)
         ).convert("RGB").resize((self.width, self.height))
 
-        target_pil = Image.open(
-            os.path.join(self.data_root, target_name)
-        ).convert("RGB").resize((self.width, self.height))
-
         input_person_pil = Image.open(
             os.path.join(self.data_root, person_name)
         ).convert("RGB").resize((self.width, self.height))
 
-        target_stem = os.path.splitext(os.path.basename(target_name))[0]
-        mask_pil = Image.open(
-            os.path.join(self.data_root, "agnostic-mask", f"{target_stem}.png")
-        ).resize((self.width, self.height))
-
-        densepose_pil = Image.open(
-            os.path.join(self.data_root, "image-densepose", f"{target_stem}.png")
-        ).convert("RGB").resize((self.width, self.height))
-
-        garment_mask_pil = Image.open(
-            os.path.join(self.data_root, "garment-mask", f"{target_stem}.png")
-        ).resize((self.width, self.height), Image.NEAREST)
-
         # Initial tensor conversion
-        person_image = self.transform(target_pil)       # [3, H, W], [-1, 1]  (diffusion GT)
         input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
-        mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
-        garment_mask = self.to_tensor(garment_mask_pil)[:1]  # [1, H, W], [0, 1]
-        pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
+
+        if self.phase != "inference":
+            target_stem = os.path.splitext(os.path.basename(target_name))[0]
+            mask_pil = Image.open(
+                os.path.join(self.data_root, "agnostic-mask", f"{target_stem}.png")
+            ).resize((self.width, self.height))
+            mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
+    
+            densepose_pil = Image.open(
+                os.path.join(self.data_root, "image-densepose", f"{target_stem}.png")
+            ).convert("RGB").resize((self.width, self.height))
+            pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
+
+            target_pil = Image.open(
+                os.path.join(self.data_root, target_name)
+            ).convert("RGB").resize((self.width, self.height))
+            person_image = self.transform(target_pil)       # [3, H, W], [-1, 1]  (diffusion GT)
+
+            garment_mask_pil = Image.open(
+                os.path.join(self.data_root, "garment-mask", f"{target_stem}.png")
+            ).resize((self.width, self.height), Image.NEAREST)
+            garment_mask = self.to_tensor(garment_mask_pil)[:1]  # [1, H, W], [0, 1]
+
+            cloth_annotation = record.get("garment_caption") or "an upper garment"
+
+        else:
+            # Generate agnostic mask and densepose on-the-fly at inference time,
+            # mirroring the logic in preprocess_fit.py.  The person image used here
+            # is the input person (wearing a *different* garment), not the target,
+            # so the mask and pose match what is available at inference time.
+            get_mask_location = _import_get_mask_location()
+
+            # OpenPose and Parsing both expect 384×512
+            small = input_person_pil.resize((384, 512))
+
+            keypoints = self.openpose_model(small)
+            model_parse, _ = self.parsing_model(small)
+            mask_pil, _ = get_mask_location(
+                "hd", self.garment_category, model_parse, keypoints
+            )
+            mask_pil = mask_pil.resize((self.width, self.height))
+
+            densepose_pil = self.densepose_fn(small).resize((self.width, self.height))
+
+            cloth_annotation = record.get("garment_caption") or "an upper garment"
+
+            mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
+            pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
+
+            # At inference time the target image is not available; use the input
+            # person image so the pipeline has a valid tensor to work with.
+            person_image = input_person
+            garment_mask = None
 
         # Training augmentations
         if self.phase == "train":
@@ -201,9 +257,10 @@ class FITDatasetWithMeasurements(data.Dataset):
         mask = mask.clamp(0, 1)
         mask[mask < 0.5] = 0.0
         mask[mask >= 0.5] = 1.0
-        garment_mask = garment_mask.clamp(0, 1)
-        garment_mask[garment_mask < 0.5] = 0.0
-        garment_mask[garment_mask >= 0.5] = 1.0
+        if garment_mask is not None:
+            garment_mask = garment_mask.clamp(0, 1)
+            garment_mask[garment_mask < 0.5] = 0.0
+            garment_mask[garment_mask >= 0.5] = 1.0
         pose = self.norm(pose)                      # [0, 1] -> [-1, 1]
 
         # Zero out the garment region of the input person (not the target)
@@ -213,7 +270,20 @@ class FITDatasetWithMeasurements(data.Dataset):
         measurement_dict = {k: record[k] for k in self.MEASUREMENT_KEYS}
         measurements = normalize_measurements(measurement_dict)  # [7]
 
-        cloth_annotation = record.get("garment_caption") or "an upper garment"
+        if self.phase == "inference":
+            return {
+                "person_image": person_image,
+                "garment_image": garment_image,
+                "garment_image_clip": garment_image_clip,
+                "pose": pose,
+                "mask": mask,
+                "masked_person": masked_person,
+                "text_prompts": "model is wearing " + cloth_annotation,
+                "text_prompts_cloth": "a photo of " + cloth_annotation,
+                "measurements": measurements,
+                "person_filename": target_name,
+                "cloth_filename": cloth_name,
+            }
 
         return {
             "person_image": person_image,

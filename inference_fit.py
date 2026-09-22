@@ -34,6 +34,7 @@ Example (after training):
 
 import argparse
 import os
+import sys
 
 import torch
 from accelerate import Accelerator
@@ -48,12 +49,33 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
+# Preprocessing models live inside gradio_demo/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "gradio_demo"))
+
 from ip_adapter.ip_adapter import Resampler
 from src.fit_dataset import FITDatasetWithMeasurements
 from src.measurement_encoder import MeasurementEncoder
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
 from src.unet_hacked_tryon import UNet2DConditionModel
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _build_densepose_predictor(device: str):
+    import apply_net
+    from detectron2.engine.defaults import DefaultPredictor
+    args = apply_net.create_argument_parser().parse_args([
+        "show",
+        os.path.join(_REPO_ROOT, "configs", "densepose_rcnn_R_50_FPN_s1x.yaml"),
+        os.path.join(_REPO_ROOT, "ckpt", "densepose", "model_final_162be9.pkl"),
+        "dp_segm", "-v",
+        "--opts", "MODEL.DEVICE", device,
+    ])
+    cfg = apply_net.ShowAction.setup_config(args.cfg, args.model, args, [])
+    predictor = DefaultPredictor(cfg)
+    context = apply_net.ShowAction.create_context(args, cfg)
+    return predictor, context
 
 
 def parse_args():
@@ -313,11 +335,37 @@ def main():
     pipe_height = args.height + pad_h
     pipe_width = args.width + pad_w
 
+    # ── Preprocessing models (needed to generate mask/densepose on-the-fly) ───
+    from preprocess.humanparsing.run_parsing import Parsing
+    from preprocess.openpose.run_openpose import OpenPose
+    import apply_net
+    from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
+
+    gpu_id = accelerator.local_process_index
+    parsing_model = Parsing(gpu_id)
+    openpose_model = OpenPose(gpu_id)
+    openpose_model.preprocessor.body_estimation.model.to(device)
+
+    densepose_predictor, densepose_context = _build_densepose_predictor(str(device))
+
+    def densepose_fn(pil_image):
+        img_bgr = convert_PIL_to_numpy(_apply_exif_orientation(pil_image), format="BGR")
+        with torch.no_grad():
+            instances = densepose_predictor(img_bgr)["instances"]
+            vis = apply_net.ShowAction.execute_on_outputs(
+                densepose_context, {"image": img_bgr}, instances
+            )
+        from PIL import Image as _Image
+        return _Image.fromarray(vis[:, :, ::-1])
+
     # ── Dataset ───────────────────────────────────────────────────────────────
     dataset = FITDatasetWithMeasurements(
         data_root=args.data_dir,
-        phase="test",
+        phase="inference",
         size=(args.height, args.width),
+        parsing_model=parsing_model,
+        openpose_model=openpose_model,
+        densepose_fn=densepose_fn,
     )
     if args.num_samples > 0:
         indices = list(range(min(args.num_samples, len(dataset))))
