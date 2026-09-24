@@ -18,7 +18,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v2
+      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
       command:
         - /bin/bash
         - -c
@@ -50,34 +50,40 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/top_3/test/",     "/tmp/top_3/test")
+          download_prefix("datasets/inference_test/",     "/tmp/inference_test")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts/",               "/tmp/scripts")
-          download_prefix("ckpt/ip_adapter/",     "/tmp/ckpt/ip_adapter")
-          #download_prefix("ckpt/image_encoder/", "/tmp/ckpt/image_encoder")
+          download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
           import os
-          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_1/checkpoint-15000") + "/"
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_2/checkpoint-15000") + "/"
           download_prefix(ckpt_prefix, "/tmp/checkpoint")
           PYEOF
 
           cp /tmp/scripts/inference_fit.py /app/inference_fit.py
+
+          # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
+          # openpose, and densepose all resolve correctly.
+          mkdir -p /app/ckpt
+          ln -sfn /tmp/yisol-IDM-VTON/humanparsing  /app/ckpt/humanparsing
+          ln -sfn /tmp/yisol-IDM-VTON/densepose     /app/ckpt/densepose
+          ln -sfn /tmp/yisol-IDM-VTON/openpose      /app/ckpt/openpose
+          ln -sfn /tmp/ckpt/ip_adapter              /app/ckpt/ip_adapter
 
           accelerate launch \
             --num_processes=1 \
             --num_machines=1 \
             inference_fit.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/top_3/test \
+            --data_dir /tmp/inference_test \
             --output_dir /tmp/inference_output \
-            --num_samples 5 \
+            --num_samples -1 \
             --mixed_precision fp16 \
             --num_inference_steps 30 \
             --guidance_scale 2.0 \
             --seed 42 \
             --checkpoint_dir /tmp/checkpoint \
             --ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-            #--pretrained_garmentnet_path /tmp/yisol-IDM-VTON \
-            #--image_encoder_path /tmp/ckpt/image_encoder
+            --densepose_path /tmp/yisol-IDM-VTON/densepose/model_final_162be9.pkl
 
           python - <<'PYEOF'
           from google.cloud import storage

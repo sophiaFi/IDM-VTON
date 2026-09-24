@@ -37,6 +37,7 @@ import os
 import sys
 
 import torch
+from PIL import Image
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL
@@ -62,13 +63,13 @@ from src.unet_hacked_tryon import UNet2DConditionModel
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
-def _build_densepose_predictor(device: str):
+def _build_densepose_predictor(device: str, model_path: str):
     import apply_net
     from detectron2.engine.defaults import DefaultPredictor
     args = apply_net.create_argument_parser().parse_args([
         "show",
         os.path.join(_REPO_ROOT, "configs", "densepose_rcnn_R_50_FPN_s1x.yaml"),
-        os.path.join(_REPO_ROOT, "ckpt", "densepose", "model_final_162be9.pkl"),
+        model_path,
         "dp_segm", "-v",
         "--opts", "MODEL.DEVICE", device,
     ])
@@ -125,6 +126,15 @@ def parse_args():
                         help="Number of IP-Adapter image tokens (must match training).")
     parser.add_argument("--mixed_precision", type=str, default=None,
                         choices=["no", "fp16", "bf16"])
+    parser.add_argument(
+        "--densepose_path", type=str,
+        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ckpt", "densepose", "model_final_162be9.pkl"),
+        help="Path to the DensePose checkpoint. Defaults to ckpt/densepose/ next to this script.",
+    )
+    parser.add_argument(
+        "--parsing_gpu_id", type=int, default=0,
+        help="GPU id passed to Parsing and OpenPose constructors.",
+    )
     return parser.parse_args()
 
 
@@ -341,12 +351,11 @@ def main():
     import apply_net
     from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
 
-    gpu_id = accelerator.local_process_index
-    parsing_model = Parsing(gpu_id)
-    openpose_model = OpenPose(gpu_id)
+    parsing_model = Parsing(args.parsing_gpu_id)
+    openpose_model = OpenPose(args.parsing_gpu_id)
     openpose_model.preprocessor.body_estimation.model.to(device)
 
-    densepose_predictor, densepose_context = _build_densepose_predictor(str(device))
+    densepose_predictor, densepose_context = _build_densepose_predictor(str(device), args.densepose_path)
 
     def densepose_fn(pil_image):
         img_bgr = convert_PIL_to_numpy(_apply_exif_orientation(pil_image), format="BGR")
@@ -466,10 +475,27 @@ def main():
                     img.crop((0, 0, args.width, args.height)) for img in images
                 ]
 
+        # person_crop_box / person_original_size come from the dataset as lists of
+        # ints; DataLoader stacks them into [B, 4] / [B, 2] tensors.
+        crop_boxes = batch["person_crop_box"]        # [B, 4]  left/top/right/bottom
+        input_person_filenames = batch["input_person_filename"]
+
         for i, (img, fname) in enumerate(zip(images, person_filenames)):
             stem = os.path.splitext(os.path.basename(fname))[0]
             out_path = os.path.join(args.output_dir, f"{stem}_result.png")
-            img.save(out_path)
+
+            left, top, right, bottom = (int(crop_boxes[k][i]) for k in range(4))
+            crop_w = right - left
+            crop_h = bottom - top
+
+            # Load the original full-resolution person image and paste the
+            # try-on result (resized back to the crop region) into it.
+            orig_person = Image.open(
+                os.path.join(args.data_dir, input_person_filenames[i])
+            ).convert("RGB")
+            result_resized = img.resize((crop_w, crop_h), Image.LANCZOS)
+            orig_person.paste(result_resized, (left, top))
+            orig_person.save(out_path)
             print(f"Saved: {out_path}")
 
 

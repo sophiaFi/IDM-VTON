@@ -18,6 +18,37 @@ from transformers import CLIPImageProcessor
 
 from src.measurement_encoder import normalize_measurements
 
+
+def _center_crop_to_aspect(pil_image: Image.Image, target_h: int, target_w: int):
+    """
+    Center-crop pil_image to the same aspect ratio as (target_h, target_w),
+    then resize to (target_w, target_h).
+
+    Returns (resized_image, crop_box) where crop_box is (left, top, right, bottom)
+    in the original image's pixel coordinates — enough to paste a result back.
+    """
+    src_w, src_h = pil_image.size
+    target_ratio = target_w / target_h
+    src_ratio = src_w / src_h
+
+    if src_ratio > target_ratio:
+        # Image is wider than target — crop width
+        crop_w = int(round(src_h * target_ratio))
+        crop_h = src_h
+    else:
+        # Image is taller than target — crop height
+        crop_w = src_w
+        crop_h = int(round(src_w / target_ratio))
+
+    left = (src_w - crop_w) // 2
+    top = (src_h - crop_h) // 2
+    crop_box = (left, top, left + crop_w, top + crop_h)
+
+    cropped = pil_image.crop(crop_box)
+    resized = cropped.resize((target_w, target_h), Image.LANCZOS)
+    return resized, crop_box
+
+
 # utils_mask lives in gradio_demo/; add it to the path when needed for inference.
 def _import_get_mask_location():
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -137,9 +168,17 @@ class FITDatasetWithMeasurements(data.Dataset):
             os.path.join(self.data_root, cloth_name)
         ).convert("RGB").resize((self.width, self.height))
 
-        input_person_pil = Image.open(
+        raw_person_pil = Image.open(
             os.path.join(self.data_root, person_name)
-        ).convert("RGB").resize((self.width, self.height))
+        ).convert("RGB")
+
+        if self.phase == "inference":
+            input_person_pil, person_crop_box = _center_crop_to_aspect(
+                raw_person_pil, self.height, self.width
+            )
+        else:
+            input_person_pil = raw_person_pil.resize((self.width, self.height))
+            person_crop_box = None
 
         # Initial tensor conversion
         input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
@@ -271,6 +310,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         measurements = normalize_measurements(measurement_dict)  # [7]
 
         if self.phase == "inference":
+            orig_w, orig_h = raw_person_pil.size
             return {
                 "person_image": person_image,
                 "garment_image": garment_image,
@@ -283,6 +323,10 @@ class FITDatasetWithMeasurements(data.Dataset):
                 "measurements": measurements,
                 "person_filename": target_name,
                 "cloth_filename": cloth_name,
+                # crop metadata for compositing the result back onto the original
+                "person_crop_box": list(person_crop_box),  # [left, top, right, bottom]
+                "person_original_size": [orig_w, orig_h],  # [W, H]
+                "input_person_filename": person_name,
             }
 
         return {
