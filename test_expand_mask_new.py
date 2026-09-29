@@ -58,17 +58,17 @@ TEXT_COLOR = (220, 220, 220)
 # Color palette
 # ---------------------------------------------------------------------------
 
-C_MASK_TINT    = (220, 60,  60)    # red tint — mask region overlay
-C_SHOULDER_HIP = (0,  210, 210)    # cyan     — shoulder-hip connections + points
-C_BUST_LINE    = (255, 230,  0)    # yellow   — bust keypoints connection
-C_MASK_BUST    = (255, 140,  0)    # orange   — mask bust width
-C_TORSO_BORDER = (220,   0, 220)   # magenta  — torso column vertical borders
-C_GARMENT_TOP  = (130, 200, 255)   # lt blue  — garment top row
-C_GARMENT_HEM  = (30,   80, 220)   # dk blue  — current garment hem
-C_TARGET_HEM   = (255, 220,   0)   # yellow   — target garment hem (dashed)
-C_SHOULDER_ROW = (255, 255, 255)   # white    — shoulder row (dashed)
-C_HIP_ROW      = (100, 220, 100)   # lime     — hip row (dashed)
-C_SH_CENTRE    = (180,  80, 220)   # purple   — shoulder-to-hip centre measure line
+C_MASK_TINT    = (220,  60,  60)   # red tint  — mask region overlay
+C_SHOULDER_HIP = (130, 200, 255)   # lt blue   — shoulder-hip connections + points
+C_BUST_LINE    = (34,  139,  34)   # green     — bust keypoints connection
+C_MASK_BUST    = (255,  88,   0)   # orange    — mask bust width
+C_TORSO_BORDER = (220,   0, 220)   # magenta   — torso column vertical borders
+C_GARMENT_TOP  = (51,   51,  51)   # gray      — garment top row
+C_GARMENT_HEM  = (30,   80, 220)   # dk blue   — current garment hem
+C_TARGET_HEM   = (0,   210, 210)   # cyan      — target garment hem (dashed)
+C_SHOULDER_ROW = (150,  42,  42)   # brown     — shoulder row (dashed)
+C_HIP_ROW      = (255, 234,   0)   # yellow    — hip row (dashed)
+C_SH_CENTRE    = (255, 153,   0)   # lt orange — shoulder-to-hip centre measure line
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ def _row_info_banner(text: str, width: int) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 def _mask_panel(mask: Image.Image, person: Image.Image | None, title: str) -> Image.Image:
-    """Panels 1–3: red-tint mask overlay on person, no annotation lines."""
+    """Panels 1-3 and 6: red-tint mask overlay on person, no annotation lines."""
     base = (person.convert("RGB").resize((PANEL_W, PANEL_H))
             if person else Image.new("RGB", (PANEL_W, PANEL_H), (80, 80, 80)))
     mask_rs = mask.convert("L").resize((PANEL_W, PANEL_H))
@@ -199,7 +199,7 @@ def _bust_debug_panel(
     # Bust keypoints connection — body_line from bust_lines (yellow)
     bust_y = bust_lines["bust_y"]
     (bx0, _), (bx1, _) = bust_lines["body_line"]
-    _draw_line_with_dots(draw, (int(round(bx0)), bust_y), (int(round(bx1)), bust_y), color=C_BUST_LINE)
+    _draw_line_with_dots(draw, (int(round(bx0)), bust_y + 1), (int(round(bx1)), bust_y + 1), color=C_BUST_LINE)
 
     # Mask bust width (orange)
     if bust_lines["mask_line"] is not None:
@@ -332,7 +332,7 @@ def _legend_strip(canvas_w: int) -> Image.Image:
             )
         return _draw
 
-    # Three rows: panels 1-3 | panel 4 bust | panel 5 length
+    # Three rows: panels 1-3 and 6 | panel 4 bust | panel 5 length
     rows = [
         [("mask region",           _tint(C_MASK_TINT))],
         [
@@ -401,7 +401,9 @@ def main():
     rows = []
     for record in records:
         person_path = os.path.join(data_root, record["person"])
+        target_path = os.path.join(data_root, record["target"])
         person_img  = Image.open(person_path).convert("RGB") if os.path.exists(person_path) else None
+        person_target_img  = Image.open(target_path).convert("RGB") if os.path.exists(target_path) else None
         small       = person_img.resize((384, 512)) if person_img else Image.new("RGB", (384, 512))
 
         keypoints  = openpose_model(small)
@@ -450,12 +452,13 @@ def main():
         p3 = _mask_panel(Image.fromarray(added),   person_img, "added region")
         p4 = _bust_debug_panel(person_img,   bust_lines,   "bust extension")
         p5 = _length_debug_panel(person_img, length_lines, "length extension")
+        p6 = _mask_panel(expanded_mask,            person_target_img, "expanded")
 
-        canvas_w = PANEL_W * 5 + PAD * 4
+        canvas_w = PANEL_W * 6 + PAD * 4
         banner   = _row_info_banner(row_info, canvas_w)
         row_img  = Image.new("RGB", (canvas_w, ROW_INFO_H + PANEL_H + LABEL_H), BG)
         row_img.paste(banner, (0, 0))
-        for i, panel in enumerate([p1, p2, p3, p4, p5]):
+        for i, panel in enumerate([p1, p2, p3, p4, p5, p6]):
             row_img.paste(panel, (i * (PANEL_W + PAD), ROW_INFO_H))
         rows.append(row_img)
 

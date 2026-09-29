@@ -60,8 +60,8 @@ MAX_BUST_EXPANSION_PX = 40
 MAX_LENGTH_EXPANSION_PX = 100
 
 # Shoulder-to-hip vertical span as a fraction of total body height.
-# Acromion to greater trochanter ≈ 30% of stature (low population variance).
-SHOULDER_HIP_TO_HEIGHT_RATIO = 0.30
+# Acromion to greater trochanter ≈ 30% of stature (low population variance) with a small buffer
+SHOULDER_HIP_TO_HEIGHT_RATIO = 0.28
 
 
 def _torso_x_bounds_at_row(
@@ -337,12 +337,17 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                 torso_np = cv2.resize(torso_np, (width, height),
                                       interpolation=cv2.INTER_NEAREST)
         torso_bounds = _torso_x_bounds_at_row(torso_np, bust_y) if torso_np is not None else None
+        if torso_np is not None:
+            torso_np = ((torso_np > 0) & (parse_mask > 0)).astype(np.uint8)
+            torso_np =  cv2.dilate(torso_np, np.ones((5, 5), np.uint16), iterations=2)
 
         # Bust-driven horizontal expansion
         if body_bust_cm is not None and garment_bust_cm is not None:
             bust_ratio = garment_bust_cm / max(body_bust_cm, 1e-6)
             if bust_ratio > 1.0:
-                body_bust_px = float(np.linalg.norm(right_bust_pt - left_bust_pt))
+                # factor to extend bust width since it is a bit wider than the distance between the bust points
+                BUST_WIDTH_FACTOR = 1.12
+                body_bust_px = float(np.linalg.norm(right_bust_pt - left_bust_pt)) * BUST_WIDTH_FACTOR
                 target_mask_bust_px = body_bust_px * bust_ratio
                 print(f"target_mask_bust_px: {target_mask_bust_px}")
 
@@ -357,15 +362,22 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                 print(f"current_mask_bust_px: {current_mask_bust_px}")
 
                 if current_mask_bust_px > 0 and current_mask_bust_px < target_mask_bust_px:
-                    extra_each_side = int(round((target_mask_bust_px - current_mask_bust_px) / 2.0))
-                    extra_each_side = min(extra_each_side, MAX_BUST_EXPANSION_PX)
-                    print(f"extra_each_side: {extra_each_side}")
-                    if extra_each_side >= 1:
-                        kernel_w = 2 * extra_each_side + 1
-                        parse_mask = cv2.dilate(
-                            parse_mask.astype(np.uint8),
-                            np.ones((1, kernel_w), np.uint8),
-                        )
+                    extra_width = int(round((target_mask_bust_px - current_mask_bust_px)))
+                    extra_width = min(extra_width, 2 * MAX_BUST_EXPANSION_PX)
+                    print(f"extra_width: {extra_width}")
+                    if extra_width > 0:
+                        kernel_w = extra_width + 1
+                        if torso_np is not None:
+                            torso_np = cv2.dilate(
+                                torso_np.astype(np.uint8),
+                                np.ones((1, kernel_w), np.uint8),
+                            )
+                            parse_mask = np.maximum(torso_np, parse_mask)
+                        else:
+                            parse_mask = cv2.dilate(
+                                parse_mask.astype(np.uint8),
+                                np.ones((1, kernel_w), np.uint8),
+                            )
 
         # Length-driven downward expansion
         if garment_length_cm is not None and body_height_cm is not None:
@@ -398,11 +410,19 @@ def get_mask_location(model_type, category, model_parse: Image.Image, keypoint: 
                         # Asymmetric kernel: anchor at bottom row → expands downward only
                         kernel_h = extra_down + 1
                         kernel = np.ones((kernel_h, 1), np.uint8)
-                        parse_mask = cv2.dilate(
-                            parse_mask.astype(np.uint8),
-                            kernel,
-                            anchor=(0, kernel_h - 1),
-                        )
+                        if torso_np is not None:
+                           torso_np = cv2.dilate(
+                               torso_np.astype(np.uint8),
+                               kernel,
+                               anchor=(0, kernel_h - 1),
+                           )
+                           parse_mask = np.maximum(torso_np, parse_mask)
+                        else:
+                            parse_mask = cv2.dilate(
+                                parse_mask.astype(np.uint8),
+                                kernel,
+                                anchor=(0, kernel_h - 1),
+                            )
 
                 if debug_dir is not None:
                     # Visualize important points and lines used for calculations
