@@ -65,10 +65,10 @@ C_MASK_BUST    = (255,  88,   0)   # orange    — mask bust width
 C_TORSO_BORDER = (220,   0, 220)   # magenta   — torso column vertical borders
 C_GARMENT_TOP  = (51,   51,  51)   # gray      — garment top row
 C_GARMENT_HEM  = (30,   80, 220)   # dk blue   — current garment hem
-C_TARGET_HEM   = (0,   210, 210)   # cyan      — target garment hem (dashed)
+C_TARGET_HEM   = (0,   210, 210)   # cyan      — target garment hem
 C_SHOULDER_ROW = (150,  42,  42)   # brown     — shoulder row (dashed)
 C_HIP_ROW      = (255, 234,   0)   # yellow    — hip row (dashed)
-C_SH_CENTRE    = (255, 153,   0)   # lt orange — shoulder-to-hip centre measure line
+C_SH_CENTRE    = (255, 153,   0)   # lt orange — shoulder-to-hip centre measure line (dashed)
 
 
 # ---------------------------------------------------------------------------
@@ -159,11 +159,55 @@ def _mask_panel(mask: Image.Image, person: Image.Image | None, title: str) -> Im
     out.paste(composite, (0, LABEL_H))
     return out
 
+def _side_legend(
+    height: int,
+    items: list[tuple[str, tuple[int, int, int], str]],
+) -> Image.Image:
+    f = _font(16)
+
+    legend_w = 180
+    legend_h = height
+
+    img = Image.new("RGB", (legend_w, legend_h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+
+    draw.text((LEGEND_PAD, LEGEND_PAD), "Legende:", fill=(0, 0, 0), font=f,)
+
+    y = 1.5 * (LEGEND_PAD + LABEL_H)
+
+    for label_text, color, line_style in items:
+        x_start = LEGEND_PAD
+        x_end = LEGEND_PAD + SWATCH_W
+
+        if line_style == "dashed":
+            dash_length = 6
+            gap_length = 4
+            x = x_start
+
+            while x < x_end:
+                x2 = min(x + dash_length, x_end)
+                draw.line([(x, y), (x2, y)], fill=color, width=2,)
+                x += dash_length + gap_length
+        else:
+            draw.line([(x_start, y), (x_end, y)], fill=color, width=2,)
+
+        r = 6
+        draw.ellipse([(x_start - r, y - r), (x_start + r, y + r)], fill=color,)
+        draw.ellipse([(x_end - r, y - r), (x_end + r, y + r)], fill=color,)
+        draw.multiline_text((x_end + 8, y - 8), label_text, fill=(0, 0, 0), font=f, spacing=2,)
+
+        if "\n" in label_text:
+            y += LEGEND_ITEM_H * 2.2
+        else:
+            y += LEGEND_ITEM_H * 1.2
+
+    return img
 
 def _bust_debug_panel(
     person: Image.Image | None,
     bust_lines: dict,
     title: str,
+    save_separate_image: bool = False,
 ) -> Image.Image:
     """Panel 4: bust-extension geometry.
 
@@ -206,6 +250,19 @@ def _bust_debug_panel(
         (mx0, _), (mx1, _) = bust_lines["mask_line"]
         _draw_line_with_dots(draw, (int(round(mx0)), bust_y), (int(round(mx1)), bust_y), color=C_MASK_BUST)
 
+    if save_separate_image:
+        bust_items = [
+            ("Schulter-Hüft\n-Linien", C_SHOULDER_HIP, "solid"),
+            ("Brustlinie", C_BUST_LINE, "solid"),
+            ("Brustweite\nder Maske", C_MASK_BUST, "solid"),
+            ("Vertikale Grenzen\nder Torso-Region", C_TORSO_BORDER, "solid"),
+        ]
+        legend = _side_legend(PANEL_H, bust_items)
+        out = Image.new("RGB", (PANEL_W + legend.width, PANEL_H), (255, 255, 255),)
+        out.paste(base, (0, 0))
+        out.paste(legend, (PANEL_W, 0))
+        out.save("bust_expansion.png")
+
     label = _label(title)
     out   = Image.new("RGB", (PANEL_W, PANEL_H + LABEL_H), BG)
     out.paste(label, (0, 0))
@@ -217,17 +274,18 @@ def _length_debug_panel(
     person: Image.Image | None,
     length_lines: dict,
     title: str,
+    save_separate_image: bool = False,
 ) -> Image.Image:
     """Panel 5: length-extension geometry.
 
     Draws:
       - Torso column borders as full-height vertical magenta lines
-      - Garment top row (light blue solid)
-      - Current garment hem (dark blue solid)
-      - Target garment hem (yellow dashed)
-      - Dashed line between shoulder points (white)
-      - Dashed line between hip points (lime green)
-      - Shoulder-to-hip centre measure line (purple, shoulder centre → hip centre)
+      - Garment top row
+      - Current garment hem
+      - Target garment hem
+      - Dashed line between shoulder points
+      - Dashed line between hip points
+      - Shoulder-to-hip centre measure line
     """
     base = (person.convert("RGB").resize((PANEL_W, PANEL_H))
             if person else Image.new("RGB", (PANEL_W, PANEL_H), (80, 80, 80)))
@@ -244,39 +302,55 @@ def _length_debug_panel(
         _draw_vline(draw, line_x0, 0, PANEL_H - 1, C_TORSO_BORDER)
         _draw_vline(draw, line_x1, 0, PANEL_H - 1, C_TORSO_BORDER)
 
-    # Garment top (light blue)
+    # Garment top
     garment_top_y = int(round(length_lines["garment_top_y"]))
     _draw_line_with_dots(draw, (line_x0, garment_top_y), (line_x1, garment_top_y), color=C_GARMENT_TOP, r=3)
 
-    # Current garment hem (dark blue)
+    # Current garment hem
     garment_hem_y = int(round(length_lines["garment_hem_y"]))
     _draw_line_with_dots(draw, (line_x0, garment_hem_y), (line_x1, garment_hem_y), color=C_GARMENT_HEM, r=3)
 
-    # Target garment hem (yellow dashed)
+    # Target garment hem
     target_hem_y = int(round(min(length_lines["target_garment_hem_y"], PANEL_H - 1)))
-    _draw_dashed_hline(draw, target_hem_y, line_x0, line_x1, color=C_TARGET_HEM, width=2)
-    r = 3
-    draw.ellipse([(line_x1 - r, target_hem_y - r), (line_x1 + r, target_hem_y + r)], fill=C_TARGET_HEM)
+    _draw_line_with_dots(draw, (line_x0, target_hem_y), (line_x1, target_hem_y), color=C_TARGET_HEM, r=3)
 
-    # Shoulder row: dashed line between the two shoulder points (white)
+    # Shoulder row: line between the two shoulder points
     ls = tuple(int(round(v)) for v in length_lines["left_shoulder"])
     rs = tuple(int(round(v)) for v in length_lines["right_shoulder"])
     _draw_dashed_line(draw, ls, rs, color=C_SHOULDER_ROW, width=2)
+    r = 3
     for pt in [ls, rs]:
         draw.ellipse([(pt[0] - r, pt[1] - r), (pt[0] + r, pt[1] + r)], fill=C_SHOULDER_ROW)
 
-    # Hip row: dashed line between the two hip points (lime green)
+    # Hip row: line between the two hip points
     lh = tuple(int(round(v)) for v in length_lines["left_hip"])
     rh = tuple(int(round(v)) for v in length_lines["right_hip"])
     _draw_dashed_line(draw, lh, rh, color=C_HIP_ROW, width=2)
     for pt in [lh, rh]:
         draw.ellipse([(pt[0] - r, pt[1] - r), (pt[0] + r, pt[1] + r)], fill=C_HIP_ROW)
 
-    # Shoulder-to-hip centre measure line (purple)
-    # — connects midpoint of shoulder pair to midpoint of hip pair
+    # Shoulder-to-hip centre measure line
     sc = (int(round((ls[0] + rs[0]) / 2.0)), int(round((ls[1] + rs[1]) / 2.0)))
     hc = (int(round((lh[0] + rh[0]) / 2.0)), int(round((lh[1] + rh[1]) / 2.0)))
-    _draw_line_with_dots(draw, sc, hc, color=C_SH_CENTRE, r=4)
+    _draw_dashed_line(draw, sc, hc, color=C_SH_CENTRE, width=2)
+    for pt in [sc, hc]:
+        draw.ellipse([(pt[0] - r, pt[1] - r), (pt[0] + r, pt[1] + r)], fill=C_SH_CENTRE)
+
+    if save_separate_image:
+        length_items = [
+            ("Obere Kante\ndes Oberteils", C_GARMENT_TOP, "solid"),
+            ("Saum des\nOberteils", C_GARMENT_HEM, "solid"),
+            ("Ziel-Saum\nder Maske", C_TARGET_HEM, "solid"),
+            ("Schulterlinie", C_SHOULDER_ROW, "dashed"),
+            ("Hüftlinie", C_HIP_ROW, "dashed"),
+            ("Schulter-Hüft-\nMittellinie", C_SH_CENTRE, "dashed"),
+            ("Vertikale Grenzen\nder Torso-Region", C_TORSO_BORDER, "solid"),
+        ]
+        legend = _side_legend(PANEL_H, length_items)
+        out = Image.new("RGB", (PANEL_W + legend.width, PANEL_H), (255, 255, 255),)
+        out.paste(base, (0, 0))
+        out.paste(legend, (PANEL_W, 0))
+        out.save("length_expansion.png")
 
     label = _label(title)
     out   = Image.new("RGB", (PANEL_W, PANEL_H + LABEL_H), BG)
@@ -344,10 +418,10 @@ def _legend_strip(canvas_w: int) -> Image.Image:
         [
             ("garment top",        _solid(C_GARMENT_TOP)),
             ("current hem",        _solid(C_GARMENT_HEM)),
-            ("target hem",         _dashed(C_TARGET_HEM)),
+            ("target hem",         _solid(C_TARGET_HEM)),
             ("shoulder row",       _dashed(C_SHOULDER_ROW)),
             ("hip row",            _dashed(C_HIP_ROW)),
-            ("shoulder-hip centre", _solid(C_SH_CENTRE)),
+            ("shoulder-hip centre", _dashed(C_SH_CENTRE)),
         ],
     ]
 
@@ -450,8 +524,8 @@ def main():
         p1 = _mask_panel(baseline_mask,           person_img, "baseline")
         p2 = _mask_panel(expanded_mask,            person_img, "expanded")
         p3 = _mask_panel(Image.fromarray(added),   person_img, "added region")
-        p4 = _bust_debug_panel(person_img,   bust_lines,   "bust extension")
-        p5 = _length_debug_panel(person_img, length_lines, "length extension")
+        p4 = _bust_debug_panel(person_img,   bust_lines,   "bust extension", True)
+        p5 = _length_debug_panel(person_img, length_lines, "length extension", True)
         p6 = _mask_panel(expanded_mask,            person_target_img, "expanded")
 
         canvas_w = PANEL_W * 6 + PAD * 4
