@@ -128,6 +128,8 @@ def parse_args():
                    help="Number of validation batches used to compute the trial metric.")
     p.add_argument("--pruner_min_resource", type=int, default=200)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--val_split", type=float, default=0.1,
+                   help="Fraction of train/ to use for validation. test/ is kept held out for final evaluation.")
     # GCS study persistence for spot preemption resilience
     p.add_argument("--gcs_study_bucket", type=str, default=None)
     p.add_argument("--gcs_study_prefix", type=str, default="hpo/study.db")
@@ -250,8 +252,6 @@ class FrozenComponents:
         self.ip_state_dict = state_dict  # reused when rebuilding Resampler per trial
         self.device = device
         self.weight_dtype = weight_dtype
-        if args.gradient_checkpointing:
-            self.unet_encoder.enable_gradient_checkpointing()
 
 
 def _build_trial_unet(frozen: FrozenComponents, lora_rank: int, lora_alpha: int,
@@ -307,7 +307,7 @@ def make_objective(frozen: FrozenComponents, train_loader, val_loader, args):
             frozen, lora_rank, lora_alpha, args.gradient_checkpointing
         )
         measurement_encoder = MeasurementEncoder(
-            num_measurements=7, hidden_dim=256,
+            num_measurements=9, hidden_dim=256,
             output_dim=frozen.cross_attn_dim, dropout=menc_dropout, use_fourier=False,
         ).to(device)
 
@@ -594,13 +594,15 @@ def main():
     print("Loading frozen components (once for all trials)...")
     frozen = FrozenComponents(args, device, weight_dtype)
 
-    train_ds = FITDatasetWithMeasurements(
+    full_train_ds = FITDatasetWithMeasurements(
         data_root=os.path.join(args.data_dir, "train"),
         phase="train", size=(args.height, args.width),
     )
-    val_ds = FITDatasetWithMeasurements(
-        data_root=os.path.join(args.data_dir, "test"),
-        phase="test", size=(args.height, args.width),
+    n_val = max(1, int(len(full_train_ds) * args.val_split))
+    n_train = len(full_train_ds) - n_val
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_train_ds, [n_train, n_val],
+        generator=torch.Generator().manual_seed(args.seed),
     )
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=1, shuffle=True, num_workers=4, pin_memory=True

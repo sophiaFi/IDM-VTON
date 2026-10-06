@@ -100,7 +100,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         masked_person     [3, H, W]       [-1, 1]        person_image with garment zeroed out
         text_prompts      str             —              person caption
         text_prompts_cloth str            —              garment caption
-        measurements      [7]             z-scored       body + garment measurements
+        measurements      [9]             z-scored       body + garment measurements + bust_ease + hem_drop
         person_filename   str             —              target filename (for saving/debugging)
         cloth_filename    str             —              cloth filename (for saving/debugging)
     """
@@ -114,7 +114,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         self,
         data_root: str,
         phase: Literal["train", "test", "inference"] = "train",
-        size: Tuple[int, int] = (512, 682),
+        size: Tuple[int, int] = (512, 680),  # width must be divisible by 8 for VAE
         parsing_model=None,
         openpose_model=None,
         densepose_fn: Optional[Callable] = None,
@@ -152,6 +152,14 @@ class FITDatasetWithMeasurements(data.Dataset):
 
         with open(os.path.join(data_root, "measurements.json"), "r") as f:
             self.records = json.load(f)
+
+        if self.records and "garment_caption" not in self.records[0]:
+            import warnings
+            warnings.warn(
+                "measurements.json has no 'garment_caption' field — all cloth text prompts "
+                "will fall back to 'an upper garment'. Add captions for better conditioning.",
+                UserWarning, stacklevel=2,
+            )
 
     def __len__(self):
         return len(self.records)
@@ -254,18 +262,13 @@ class FITDatasetWithMeasurements(data.Dataset):
                     color_jitter.brightness, color_jitter.contrast,
                     color_jitter.saturation, color_jitter.hue,
                 )
-                person_image = TF.adjust_contrast(person_image, c)
-                person_image = TF.adjust_brightness(person_image, b)
-                person_image = TF.adjust_hue(person_image, h)
-                person_image = TF.adjust_saturation(person_image, s)
-                input_person = TF.adjust_contrast(input_person, c)
-                input_person = TF.adjust_brightness(input_person, b)
-                input_person = TF.adjust_hue(input_person, h)
-                input_person = TF.adjust_saturation(input_person, s)
-                cloth_pil = TF.adjust_contrast(cloth_pil, c)
-                cloth_pil = TF.adjust_brightness(cloth_pil, b)
-                cloth_pil = TF.adjust_hue(cloth_pil, h)
-                cloth_pil = TF.adjust_saturation(cloth_pil, s)
+                _jitter_fns   = [TF.adjust_brightness, TF.adjust_contrast, TF.adjust_saturation, TF.adjust_hue]
+                _jitter_vals  = [b, c, s, h]
+                for fn_i in fn_idx:
+                    fn, val = _jitter_fns[fn_i], _jitter_vals[fn_i]
+                    person_image = fn(person_image, val)
+                    input_person = fn(input_person, val)
+                    cloth_pil    = fn(cloth_pil,    val)
 
             # Scale: cloth is a separate photo and not scaled with the person
             if random.random() > 0.5:
@@ -307,7 +310,7 @@ class FITDatasetWithMeasurements(data.Dataset):
 
         # Z-score normalize measurements using precomputed dataset statistics
         measurement_dict = {k: record[k] for k in self.MEASUREMENT_KEYS}
-        measurements = normalize_measurements(measurement_dict)  # [7]
+        measurements = normalize_measurements(measurement_dict)  # [9]
 
         if self.phase == "inference":
             orig_w, orig_h = raw_person_pil.size
@@ -356,7 +359,7 @@ if __name__ == "__main__":
 
     with tempfile.TemporaryDirectory() as tmp:
         # Build a minimal dummy dataset on disk
-        for subdir in ["cloth", "target", "image-densepose", "agnostic-mask", "garment-mask"]:
+        for subdir in ["cloth", "person", "target", "image-densepose", "agnostic-mask", "garment-mask"]:
             os.makedirs(os.path.join(tmp, subdir))
 
         dummy_rgb = Image.fromarray(
@@ -370,6 +373,7 @@ if __name__ == "__main__":
         for i in range(4):
             image_name = f"{i:04d}.png"
             dummy_rgb.save(os.path.join(tmp, "cloth", image_name))
+            dummy_rgb.save(os.path.join(tmp, "person", image_name))
             dummy_rgb.save(os.path.join(tmp, "target", image_name))
             dummy_rgb.save(os.path.join(tmp, "image-densepose", image_name))
             dummy_gray.save(os.path.join(tmp, "agnostic-mask", image_name))
@@ -412,5 +416,5 @@ if __name__ == "__main__":
         print(f"  mask:              {tuple(batch['mask'].shape)}")
         print(f"  garment_mask:      {tuple(batch['garment_mask'].shape)}")
         print(f"  masked_person:     {tuple(batch['masked_person'].shape)}")
-        print(f"  measurements:      {tuple(batch['measurements'].shape)}")
+        print(f"  measurements:      {tuple(batch['measurements'].shape)}")  # expect (2, 9)
         print("\nAll checks passed.")

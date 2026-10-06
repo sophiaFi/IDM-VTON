@@ -102,11 +102,14 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=4,
                         help="LoRA alpha (scaling = alpha / rank). Use alpha == rank for scale 1.")
     # Image dimensions
-    parser.add_argument("--width", type=int, default=768)
-    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=680)   # must be divisible by 8 for VAE (682//8=85 but VAE output=86 → crash)
+    parser.add_argument("--height", type=int, default=512)
     # Training
     parser.add_argument("--train_batch_size", type=int, default=6)
     parser.add_argument("--test_batch_size", type=int, default=4)
+    parser.add_argument("--val_split", type=float, default=0.1,
+                        help="Fraction of train/ to use for validation (rest is training). "
+                             "test/ is kept fully held out for final evaluation.")
     parser.add_argument("--num_train_epochs", type=int, default=130)
     parser.add_argument("--max_train_steps", type=int, default=None)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -451,7 +454,7 @@ def main():
     # ── MeasurementEncoder ────────────────────────────────────────────────────
     cross_attn_dim = unet.config.cross_attention_dim  # 2048 for SDXL
     measurement_encoder = MeasurementEncoder(
-        num_measurements=7,
+        num_measurements=9,
         hidden_dim=256,
         output_dim=cross_attn_dim,
         dropout=0.1,
@@ -480,7 +483,8 @@ def main():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        unet_encoder.enable_gradient_checkpointing()
+        # unet_encoder is frozen — gradient checkpointing on it adds recomputation overhead
+        # with no memory benefit since no backward flows through it.
 
     # ── Freeze everything, then apply LoRA selectively ───────────────────────
     vae.requires_grad_(False)
@@ -547,18 +551,24 @@ def main():
         _log_mem("after-model-load", 0)
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    train_dataset = FITDatasetWithMeasurements(
+    # Both train and validation splits are drawn from data_dir/train/ so that
+    # data_dir/test/ stays completely held out for final evaluation.
+    # Hyperparameters and checkpoints are selected on the val split only.
+    full_train_dataset = FITDatasetWithMeasurements(
         data_root=args.data_dir, phase="train", size=(args.height, args.width)
+    )
+    n_val = max(1, int(len(full_train_dataset) * args.val_split))
+    n_train = len(full_train_dataset) - n_val
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_train_dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(args.seed if args.seed is not None else 0),
     )
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, pin_memory=True, shuffle=True,
         batch_size=args.train_batch_size, num_workers=4,
     )
-    test_dataset = FITDatasetWithMeasurements(
-        data_root=args.data_dir, phase="test", size=(args.height, args.width)
-    )
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, shuffle=False, batch_size=args.test_batch_size, num_workers=4,
+        val_dataset, shuffle=False, batch_size=args.test_batch_size, num_workers=4,
     )
 
     # ── Step count ────────────────────────────────────────────────────────────
@@ -629,6 +639,14 @@ def main():
         menc_state = torch.load(os.path.join(resume_path, "measurement_encoder.pt"), map_location="cpu")
         accelerator.unwrap_model(measurement_encoder).load_state_dict(menc_state)
 
+        # Restore optimizer and LR scheduler so Adam moments and LR position are preserved
+        opt_path = os.path.join(resume_path, "optimizer.pt")
+        if os.path.exists(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+        sched_path = os.path.join(resume_path, "lr_scheduler.pt")
+        if os.path.exists(sched_path):
+            lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
+
         # Derive global_step and first_epoch from checkpoint directory name (checkpoint-<step>)
         ckpt_name = os.path.basename(resume_path.rstrip("/\\"))
         if ckpt_name.startswith("checkpoint-"):
@@ -655,6 +673,7 @@ def main():
         """Run one test batch through the pipeline and save images tagged with `tag`."""
         if not accelerator.is_main_process:
             return
+        menc_unwrapped = accelerator.unwrap_model(measurement_encoder)
         with torch.no_grad(), torch.cuda.amp.autocast():
             merged_unet = accelerator.unwrap_model(unet).merge_and_unload()
             newpipe = TryonPipeline.from_pretrained(
@@ -675,16 +694,39 @@ def main():
             ).to(accelerator.device)
 
             for sample in test_dataloader:
+                # Compute measurement tokens for this batch so validation images reflect
+                # measurement conditioning (matching the training forward pass).
+                meas = sample["measurements"].to(accelerator.device, dtype=torch.float32)
+                menc_tokens = menc_unwrapped(meas, measurement_dropout_prob=0.0)  # [B, 1, 2048]
+
+                # Patch the pipeline UNet forward to inject the measurement token.
+                # During CFG the UNet receives a 2B batch ([uncond; cond]), so repeat to match.
+                _orig_unet_fwd = newpipe.unet.forward
+                def _fwd_with_measurements(
+                    sample_t, timestep, encoder_hidden_states, *args,
+                    _tok=menc_tokens.to(dtype=torch.float16), **kwargs
+                ):
+                    B_unet = encoder_hidden_states.shape[0]
+                    B_tok  = _tok.shape[0]
+                    tok = _tok.repeat(B_unet // B_tok, 1, 1) if B_unet > B_tok else _tok[:B_unet]
+                    enc = torch.cat(
+                        [encoder_hidden_states, tok.to(dtype=encoder_hidden_states.dtype)], dim=1
+                    )
+                    return _orig_unet_fwd(sample_t, timestep, enc, *args, **kwargs)
+                newpipe.unet.forward = _fwd_with_measurements
+
+                # Pass CLIP-preprocessed pixels to ip_adapter_image. The pipeline
+                # encodes them internally through image_encoder + Resampler, which is
+                # equivalent to the training forward pass.
                 img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
                 num_prompts = len(img_emb_list)
+                image_embeds = torch.cat(img_emb_list, dim=0).to(accelerator.device)  # [B, 3, 224, 224]
                 prompt = sample["text_prompts"]
                 negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
                 if not isinstance(prompt, List):
                     prompt = [prompt] * num_prompts
                 if not isinstance(negative_prompt, List):
                     negative_prompt = [negative_prompt] * num_prompts
-
-                image_embeds = torch.cat(img_emb_list, dim=0)
 
                 with torch.inference_mode():
                     (
@@ -707,6 +749,7 @@ def main():
                         negative_prompt=negative_prompt_cloth,
                     )
                     generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed else None
+                    dev = accelerator.device
                     images = newpipe(
                         prompt_embeds=prompt_embeds,
                         negative_prompt_embeds=negative_prompt_embeds,
@@ -715,11 +758,11 @@ def main():
                         num_inference_steps=args.num_inference_steps,
                         generator=generator,
                         strength=1.0,
-                        pose_img=sample["pose"],
+                        pose_img=sample["pose"].to(dev, dtype=torch.float16),
                         text_embeds_cloth=prompt_embeds_c,
-                        cloth=sample["garment_image"].to(accelerator.device),
-                        mask_image=sample["mask"],
-                        image=(sample["person_image"] + 1.0) / 2.0,
+                        cloth=sample["garment_image"].to(dev, dtype=torch.float16),
+                        mask_image=sample["mask"].to(dev, dtype=torch.float16),
+                        image=((sample["person_image"] + 1.0) / 2.0).to(dev, dtype=torch.float16),
                         height=args.height,
                         width=args.width,
                         guidance_scale=args.guidance_scale,
@@ -727,6 +770,14 @@ def main():
                     )[0]
                 for i, img in enumerate(images):
                     img.save(os.path.join(args.output_dir, f"{tag}_{i}_test.jpg"))
+                    # Also save the input person image so input vs. output can be compared.
+                    person_np = (
+                        (sample["person_image"][i].cpu().float() + 1.0) / 2.0
+                    ).clamp(0, 1).permute(1, 2, 0).mul(255).byte().numpy()
+                    from PIL import Image as _PILImage
+                    _PILImage.fromarray(person_np).save(
+                        os.path.join(args.output_dir, f"{tag}_{i}_input.jpg")
+                    )
                 break
 
             del merged_unet, newpipe
@@ -738,7 +789,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         for _, batch in enumerate(train_dataloader):
             step_start = time.perf_counter()
-            with accelerator.accumulate(unet), accelerator.accumulate(measurement_encoder):
+            with accelerator.accumulate(unet):
 
                 # ── Validation samples ────────────────────────────────────────
                 if global_step % args.logging_steps == 0:
@@ -796,10 +847,10 @@ def main():
 
                 # ── SDXL time/size conditioning ───────────────────────────────
                 def compute_time_ids(original_size, crops_coords_top_left=(0, 0)):
-                    add_time_ids = list(original_size + crops_coords_top_left + (args.height, args.height))
+                    add_time_ids = list(original_size + crops_coords_top_left + (args.height, args.width))
                     return torch.tensor([add_time_ids]).to(accelerator.device)
 
-                add_time_ids = torch.cat([compute_time_ids((args.height, args.height)) for _ in range(bsz)])
+                add_time_ids = torch.cat([compute_time_ids((args.height, args.width)) for _ in range(bsz)])
 
                 # ── IP-Adapter: garment CLIP image embeddings ─────────────────
                 image_embeds = torch.cat([batch["garment_image_clip"][i] for i in range(bsz)], dim=0)
@@ -856,7 +907,8 @@ def main():
                     if noise_scheduler.config.prediction_type == "v_prediction":
                         snr = snr + 1
                     weights = (
-                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+                        torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
+                        / snr.clamp(min=1e-8)  # rescale_betas_zero_snr sets snr[T]=0; clamp avoids NaN
                     )
                     loss = (F.mse_loss(noise_pred.float(), target.float(), reduction="none")
                             .mean(dim=list(range(1, noise_pred.ndim))) * weights).mean()
@@ -994,6 +1046,11 @@ def main():
                 accelerator.unwrap_model(measurement_encoder).state_dict(),
                 os.path.join(save_path, "measurement_encoder.pt"),
             )
+
+            # Optimizer and LR scheduler state — required for a proper spot-preemption resume
+            # (without these, Adam moments are lost and the LR position resets)
+            torch.save(optimizer.state_dict(), os.path.join(save_path, "optimizer.pt"))
+            torch.save(lr_scheduler.state_dict(), os.path.join(save_path, "lr_scheduler.pt"))
 
             # Upload checkpoint to GCS so it survives spot preemption
             if args.gcs_checkpoint_bucket:

@@ -307,7 +307,7 @@ def main():
         # Load MeasurementEncoder
         cross_attn_dim = unet.config.cross_attention_dim
         measurement_encoder = MeasurementEncoder(
-            num_measurements=7,
+            num_measurements=9,
             hidden_dim=256,
             output_dim=cross_attn_dim,
             dropout=0.1,
