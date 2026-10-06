@@ -488,15 +488,44 @@ def main():
             crop_w = right - left
             crop_h = bottom - top
 
-            # Load the original full-resolution person image and paste the
-            # try-on result (resized back to the crop region) into it.
+            # Load the original full-resolution person image and composite the
+            # try-on result into it.  Only the masked (garment) region is taken
+            # from the model output; everything else — including the face — is
+            # restored from the original crop so it is pixel-perfect at full res.
             orig_person = Image.open(
                 os.path.join(args.data_dir, input_person_filenames[i])
             ).convert("RGB")
             result_resized = img.resize((crop_w, crop_h), Image.LANCZOS)
+
+            res_path = os.path.join(args.output_dir, f"{stem}_generated.png")
+            result_resized.save(res_path)
+            print(f"Saved: {res_path}")
+
+            # Upscale the binary mask to the crop region size (NEAREST to keep it binary).
+            mask_crop = Image.fromarray(
+                masks[i, 0].cpu().float().mul(255).byte().numpy()
+            ).resize((crop_w, crop_h), Image.NEAREST)
+
+            # Paste original crop over the result everywhere the mask is 0 (non-garment).
+            # Inverted mask: 255 where mask=0 (keep original), 0 where mask=1 (garment).
+            inv_mask = mask_crop.convert("L").point(lambda p: 0 if p > 127 else 255)
+            orig_crop = orig_person.crop((left, top, right, bottom))
+            result_resized.paste(orig_crop, mask=inv_mask)
             orig_person.paste(result_resized, (left, top))
             orig_person.save(out_path)
             print(f"Saved: {out_path}")
+
+            # Save mask debug image at model resolution: person image with masked
+            # region highlighted in semi-transparent red so the inpaint area is visible.
+            person_vis = ((person_images[i].cpu().float() + 1.0) / 2.0).clamp(0, 1)  # [3, H, W]
+            mask_vis = masks[i, 0].cpu().float()  # [H, W], values in {0, 1}
+            r = (person_vis[0] * (1 - 0.5 * mask_vis) + 0.5 * mask_vis).clamp(0, 1)
+            g = (person_vis[1] * (1 - 0.5 * mask_vis)).clamp(0, 1)
+            b = (person_vis[2] * (1 - 0.5 * mask_vis)).clamp(0, 1)
+            vis_arr = torch.stack([r, g, b], dim=0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+            mask_out = os.path.join(args.output_dir, f"{stem}_mask.png")
+            Image.fromarray(vis_arr).save(mask_out)
+            print(f"Saved: {mask_out}")
 
 
 if __name__ == "__main__":
