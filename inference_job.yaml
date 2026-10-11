@@ -55,7 +55,7 @@ workerPoolSpecs:
           download_prefix("scripts/",               "/tmp/scripts")
           download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
           import os
-          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_2/checkpoint-15000") + "/"
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_2/checkpoint-10800") + "/"
           download_prefix(ckpt_prefix, "/tmp/checkpoint")
           PYEOF
 

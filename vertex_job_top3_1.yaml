@@ -61,7 +61,7 @@ workerPoolSpecs:
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
 
-          # Top-3 config run 1 — 5 epochs, ~5000 training samples.
+          # Top-3 config run 1 - 5 epochs, ~5000 training samples.
           accelerate launch \
             --num_processes=1 \
             --num_machines=1 \
@@ -81,11 +81,11 @@ workerPoolSpecs:
             --checkpointing_epoch 1 \
             --gcs_checkpoint_bucket ma-idm-vton-data \
             --gcs_checkpoint_prefix top3_run_1/checkpoints \
-            --learning_rate 1.2676006491664328e-05 \
-            --lora_rank 32 \
-            --lora_alpha 64 \
-            --fit_loss_weight 0.03561855146099667 \
-            --measurement_dropout 0.10438874400689785 \
+            --learning_rate 7.078047821727216e-05 \
+            --lora_rank 16 \
+            --lora_alpha 32 \
+            --fit_loss_weight 0.0667007322947555 \
+            --measurement_dropout 0.1885853442734069 \
             --lr_scheduler_type cosine
 
           # Upload any files in /tmp/output (images, checkpoints) to GCS

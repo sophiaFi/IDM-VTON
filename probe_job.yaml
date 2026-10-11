@@ -28,7 +28,7 @@ workerPoolSpecs:
 
           pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0 peft
 
-          CHECKPOINT_PREFIX="checkpoints/checkpoint-200"
+          CHECKPOINT_PREFIX="top3_run_2/checkpoint-10800"
 
           python - <<'PYEOF'
           from google.cloud import storage
@@ -53,9 +53,9 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "checkpoints/checkpoint-200") + "/"
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "top3_run_2/checkpoint-10800") + "/"
           download_prefix("scripts/",                    "/tmp/scripts")
-          download_prefix("datasets/fit-mini/",          "/tmp/fit-mini")
+          download_prefix("datasets/top_3/test/",          "/tmp/top_3/test")
           download_prefix("models/yisol-IDM-VTON/",      "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/",            "/tmp/ckpt/ip_adapter")
           download_prefix(ckpt_prefix,                   "/tmp/checkpoint")
@@ -66,7 +66,7 @@ workerPoolSpecs:
           python probe_measurement_sensitivity.py \
             --checkpoint /tmp/checkpoint \
             --pretrained_model /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/fit-mini \
+            --data_dir /tmp/top_3/test \
             --height 512 \
             --width 384 \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \

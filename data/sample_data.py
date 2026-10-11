@@ -13,6 +13,7 @@ Run with:
 """
 import json
 import argparse
+import random
 import numpy as np
 from itertools import islice
 from datasets import load_dataset
@@ -40,12 +41,14 @@ if not data_path.exists() or not parquet_files:
         repo_type="dataset",
         local_dir=str(data_path),
     )
-else:
-    print(f"Dataset found at {data_path}, skipping download")
 
+parquet_files = sorted(data_path.glob(f"{args.split}-*.parquet"))
+random.seed(42)
+random.shuffle(parquet_files)
+print(f"Found {len(parquet_files)} parquet files, shuffled across {len(parquet_files)} shards")
 
 dataset = load_dataset("parquet",
-                       data_files={args.split: str(data_path / f"{args.split}-*.parquet")},
+                       data_files={args.split: [str(f) for f in parquet_files]},
                        streaming=True,)
 
 stream = dataset[args.split].shuffle(seed=42, buffer_size=args.buffer_size)
