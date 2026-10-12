@@ -8,7 +8,7 @@
 #       --config=vertex_job_top3_2.yaml
 #
 # After the job finishes, retrieve the profile with:
-#   gsutil cp gs://ma-idm-vton-data/profile_output/resource_profile.json .
+#   gsutil cp gs://ma-idm-vton/profile_output/resource_profile.json .
 # Or read it directly from Cloud Logging (it is also printed to stdout).
 
 workerPoolSpecs:
@@ -18,7 +18,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v3
       command:
         - /bin/bash
         - -c
@@ -37,7 +37,7 @@ workerPoolSpecs:
           from google.cloud import storage
           import pathlib, sys
 
-          bucket_name = "ma-idm-vton-data"
+          bucket_name = "ma-idm-vton"
           client = storage.Client()
           bucket = client.bucket(bucket_name)
 
@@ -79,7 +79,7 @@ workerPoolSpecs:
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
             --checkpointing_epoch 1 \
-            --gcs_checkpoint_bucket ma-idm-vton-data \
+            --gcs_checkpoint_bucket ma-idm-vton \
             --gcs_checkpoint_prefix top3_run_2/checkpoints \
             --learning_rate 1.4252090642467926e-05 \
             --lora_rank 16 \
@@ -98,7 +98,7 @@ workerPoolSpecs:
           if not out_dir.exists():
               print("WARNING: /tmp/output not found — training may have failed.", file=sys.stderr)
               sys.exit(0)
-          bucket = storage.Client().bucket("ma-idm-vton-data")
+          bucket = storage.Client().bucket("ma-idm-vton")
           uploaded = 0
           for f in out_dir.rglob("*"):
               if f.is_file():
@@ -107,7 +107,7 @@ workerPoolSpecs:
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   print(f"  uploaded {blob_name}")
                   uploaded += 1
-          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton-data/top3_run_2/")
+          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton/top3_run_2/")
           PYEOF
 
 

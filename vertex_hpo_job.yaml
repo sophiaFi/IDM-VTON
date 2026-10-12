@@ -7,11 +7,11 @@
 #       --config=vertex_hpo_job.yaml
 #
 # After completion, retrieve results with:
-#   gsutil cp gs://ma-idm-vton-data/hpo/top3_configs.json .
-#   gsutil cp gs://ma-idm-vton-data/hpo/all_trials.csv .
+#   gsutil cp gs://ma-idm-vton/hpo/top3_configs.json .
+#   gsutil cp gs://ma-idm-vton/hpo/all_trials.csv .
 #
 # The Optuna SQLite study is also persisted after every trial to
-# gs://ma-idm-vton-data/hpo/study.db
+# gs://ma-idm-vton/hpo/study.db
 # If the job is preempted, resubmit this YAML and the study will resume from where it left off.
 
 workerPoolSpecs:
@@ -21,7 +21,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/ma-idm-vton-extension/idm-vton/trainer:v3
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v3
       command:
         - /bin/bash
         - -c
@@ -39,7 +39,7 @@ workerPoolSpecs:
           from google.cloud import storage
           import pathlib, sys
 
-          bucket_name = "ma-idm-vton-data"
+          bucket_name = "ma-idm-vton"
           client = storage.Client()
           bucket = client.bucket(bucket_name)
 
@@ -81,7 +81,7 @@ workerPoolSpecs:
             --pruner_min_resource 200 \
             --val_batches 20 \
             --seed 0 \
-            --gcs_study_bucket ma-idm-vton-data \
+            --gcs_study_bucket ma-idm-vton \
             --gcs_study_prefix hpo/study.db
 
           # Upload full output directory (CSV, JSON, any logs) to GCS.
@@ -93,7 +93,7 @@ workerPoolSpecs:
           if not out_dir.exists():
               print("WARNING: /tmp/hpo_output not found.", file=sys.stderr)
               sys.exit(0)
-          bucket = storage.Client().bucket("ma-idm-vton-data")
+          bucket = storage.Client().bucket("ma-idm-vton")
           uploaded = 0
           for f in out_dir.rglob("*"):
               if f.is_file():
@@ -101,7 +101,7 @@ workerPoolSpecs:
                   blob_name = f"hpo_output/{rel}".replace("\\", "/")
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   uploaded += 1
-          print(f"Uploaded {uploaded} files to gs://ma-idm-vton-data/hpo_output/")
+          print(f"Uploaded {uploaded} files to gs://ma-idm-vton/hpo_output/")
           PYEOF
 
 scheduling:
