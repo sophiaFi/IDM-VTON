@@ -125,7 +125,7 @@ def parse_args():
     parser.add_argument("--snr_gamma", type=float, default=None)
     parser.add_argument("--noise_offset", type=float, default=None)
     parser.add_argument("--measurement_dropout", type=float, default=0.1)
-    parser.add_argument("--fit_loss_weight", type=float, default=0.1,
+    parser.add_argument("--fit_loss_weight", type=float, default=0.3,
                         help="Weight for the fit loss. 0 disables it.")
     parser.add_argument("--fit_loss_boundary_weight", type=float, default=0.5,
                         help="Weight of boundary loss relative to IoU loss inside _compute_fit_loss.")
