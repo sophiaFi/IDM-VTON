@@ -286,21 +286,29 @@ def _build_trial_unet(frozen: FrozenComponents, lora_rank: int, lora_alpha: int,
     return unet.to(frozen.device, dtype=frozen.weight_dtype)
 
 
-def make_objective(frozen: FrozenComponents, train_loader, val_loader, args):
+def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
 
     def objective(trial: optuna.Trial) -> float:
         # hyperparameters
         lr            = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
         lora_rank     = trial.suggest_categorical("lora_rank", [4, 8, 16, 32])
         lora_alpha    = int(lora_rank * trial.suggest_categorical("lora_alpha_ratio", [0.5, 1.0, 2.0]))
-        fit_loss_w    = trial.suggest_float("fit_loss_weight", 0.01, 1.0, log=True)
-        menc_dropout  = trial.suggest_float("measurement_dropout", 0.0, 0.3)
+        fit_loss_w    = 0.1
+        menc_dropout  = trial.suggest_float("measurement_dropout", 0.0, 0.2)
         lr_scheduler_type = trial.suggest_categorical(
             "lr_scheduler", ["constant", "cosine"]
         )
+        batch_size    = trial.suggest_categorical("batch_size", [1, 2])
 
         torch.manual_seed(args.seed + trial.number)
         device = frozen.device
+
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=batch_size, shuffle=False, num_workers=2
+        )
 
         # trainable components
         unet = _build_trial_unet(
@@ -463,7 +471,6 @@ def make_objective(frozen: FrozenComponents, train_loader, val_loader, args):
             unet, measurement_encoder, frozen, val_loader,
             args, fit_loss_w, n_batches=args.val_batches
         )
-        trial.set_user_attr("fit_loss_weight_used", fit_loss_w)
         trial.set_user_attr("lora_rank", lora_rank)
 
         del unet, measurement_encoder, optimizer, scheduler
@@ -604,12 +611,6 @@ def main():
         full_train_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(args.seed),
     )
-    train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=1, shuffle=True, num_workers=4, pin_memory=True
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=1, shuffle=False, num_workers=2
-    )
     print(f"Dataset: {len(train_ds)} train / {len(val_ds)} val")
 
     # resume optuna study from GC if available
@@ -640,7 +641,7 @@ def main():
             _gcs_upload(study_db, args.gcs_study_bucket, args.gcs_study_prefix)
             print(f"Study checkpoint uploaded to gs://{args.gcs_study_bucket}/{args.gcs_study_prefix}")
 
-    objective = make_objective(frozen, train_loader, val_loader, args)
+    objective = make_objective(frozen, train_ds, val_ds, args)
     study.optimize(objective, n_trials=args.n_trials, callbacks=[_after_trial])
 
     # results

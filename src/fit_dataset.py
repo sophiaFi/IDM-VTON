@@ -257,10 +257,10 @@ class FITDatasetWithMeasurements(data.Dataset):
 
             # Color jitter: same params applied to garment and person so lighting stays consistent
             if random.random() > 0.5:
-                color_jitter = transforms.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.5, hue=0.5)
+                color_jitter = transforms.ColorJitter(brightness=0.5, contrast=0.3, saturation=0.5)
                 fn_idx, b, c, s, h = transforms.ColorJitter.get_params(
                     color_jitter.brightness, color_jitter.contrast,
-                    color_jitter.saturation, color_jitter.hue,
+                    color_jitter.saturation, (0.0, 0.0),
                 )
                 _jitter_fns   = [TF.adjust_brightness, TF.adjust_contrast, TF.adjust_saturation, TF.adjust_hue]
                 _jitter_vals  = [b, c, s, h]
@@ -281,8 +281,8 @@ class FITDatasetWithMeasurements(data.Dataset):
 
             # Translate
             if random.random() > 0.5:
-                shift_x = random.uniform(-0.2, 0.2)
-                shift_y = random.uniform(-0.2, 0.2)
+                shift_x = random.uniform(-0.1, 0.1)
+                shift_y = random.uniform(-0.1, 0.1)
                 person_image = TF.affine(person_image, angle=0, translate=[shift_x * person_image.shape[-1], shift_y * person_image.shape[-2]], scale=1, shear=0)
                 input_person = TF.affine(input_person, angle=0, translate=[shift_x * input_person.shape[-1], shift_y * input_person.shape[-2]], scale=1, shear=0)
                 mask         = TF.affine(mask,         angle=0, translate=[shift_x * mask.shape[-1],         shift_y * mask.shape[-2]],         scale=1, shear=0)

@@ -23,6 +23,7 @@ Checkpoint layout per saved epoch:
     measurement_encoder.pt  ← MeasurementEncoder state dict
 """
 
+import copy
 import os
 import json
 import time
@@ -675,7 +676,7 @@ def main():
             return
         menc_unwrapped = accelerator.unwrap_model(measurement_encoder)
         with torch.no_grad(), torch.cuda.amp.autocast():
-            merged_unet = accelerator.unwrap_model(unet).merge_and_unload()
+            merged_unet = copy.deepcopy(accelerator.unwrap_model(unet)).merge_and_unload()
             newpipe = TryonPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=merged_unet,
