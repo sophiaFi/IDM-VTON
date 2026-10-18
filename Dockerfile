@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir \
     transformers==4.36.2 \
     diffusers==0.25.0 \
     einops==0.7.0 \
-    bitsandbytes==0.39.0 \
+    bitsandbytes==0.41.3 \
     scipy==1.11.1 \
     peft==0.7.1 \
     huggingface_hub==0.23.4 \
@@ -45,6 +45,7 @@ COPY gradio_demo/detectron2/ gradio_demo/detectron2/
 COPY gradio_demo/densepose/ gradio_demo/densepose/
 COPY train_with_measurements.py .
 COPY train_hpo.py .
+COPY train_with_film.py .
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/huggingface

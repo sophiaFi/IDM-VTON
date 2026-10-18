@@ -11,14 +11,17 @@ FiLM (Feature-wise Linear Modulation) extension:
 - FiLM Generator Heads are initialized with γ ≈ 1, β ≈ 0 so training begins near
   the pretrained baseline and measurement influence grows gradually.
 
-Parameter-efficient fine-tuning strategy (no LoRA):
+Parameter-efficient fine-tuning strategy (LoRA on ResNet convs):
 - MeasurementEncoder: trained in full.
 - FiLMGeneratorSet (one head per target ResNet block): trained in full.
-- Deep ResNet blocks: down_blocks[-1].resnets, mid_block.resnets, up_blocks[0].resnets:
-  trained in full.  Attention layers in mid_block remain frozen.
+- Deep ResNet blocks (down_blocks[-1], mid_block.resnets, up_blocks[0]):
+    conv1 and conv2 wrapped with LoRAConv2d (rank --lora_rank, default 4).
+    Also trains: time_emb_proj, norm1, norm2 (small layers; ~57M total vs ~251M without LoRA).
+    Attention layers in mid_block remain frozen.
 - conv_in (9→13 ch expansion for densepose, same as base extension): trained in full.
 - VAE, text encoders, image encoder, GarmentNet, IP-Adapter / Resampler,
   attention layers in deep blocks, all outer TryonNet blocks: frozen.
+- Text encoders stay on CPU; moved to GPU only for the brief encoding window per step.
 
 FiLM hooks are registered via PyTorch forward hooks on each target resnet.norm2 module.
 A shared _FiLMContext object passes the current batch's measurement embedding into the
@@ -28,7 +31,7 @@ forward pass during the backward; clearing it before backward would give wrong g
 
 Checkpoint layout per saved epoch:
   checkpoint-<step>/
-    deep_unet_blocks.pt    ← state dicts for down_blocks[-1], mid_block, up_blocks[0], conv_in
+    unet_lora.pt           ← trainable UNet params only (LoRA A/B + norms + time_emb_proj + conv_in)
     film_generators.pt     ← FiLMGeneratorSet state dict
     measurement_encoder.pt ← MeasurementEncoder state dict
     optimizer.pt
@@ -80,6 +83,41 @@ class _FiLMContext:
     checkpointing recomputes the forward during the backward).
     """
     embedding: Optional[torch.Tensor] = None
+
+
+class LoRAConv2d(torch.nn.Module):
+    """Frozen Conv2d with a trainable low-rank bypass ΔW = B·A.
+
+    Approximates the full weight update with two small convolutions:
+      lora_A: (C_in → rank, 1×1) down-projects the spatial feature map
+      lora_B: (rank → C_out, k×k) up-projects back to the original spatial size
+
+    lora_B is zero-initialized so ΔW = 0 at the start of training, preserving
+    the pretrained baseline exactly.
+    """
+
+    def __init__(self, conv: torch.nn.Conv2d, rank: int = 4) -> None:
+        super().__init__()
+        self.conv = conv
+        self.conv.requires_grad_(False)
+        C_in, C_out = conv.in_channels, conv.out_channels
+        k, pad = conv.kernel_size[0], conv.padding[0]
+        self.lora_A = torch.nn.Conv2d(C_in, rank, 1, bias=False)
+        self.lora_B = torch.nn.Conv2d(rank, C_out, k, padding=pad, bias=False)
+        torch.nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lora_B.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x) + self.lora_B(self.lora_A(x))
+
+
+def _apply_lora_to_resnets(resnets: list, rank: int) -> None:
+    """Replace conv1, conv2 (and conv_shortcut if present) with LoRA-wrapped versions."""
+    for resnet in resnets:
+        resnet.conv1 = LoRAConv2d(resnet.conv1, rank=rank)
+        resnet.conv2 = LoRAConv2d(resnet.conv2, rank=rank)
+        if getattr(resnet, "conv_shortcut", None) is not None:
+            resnet.conv_shortcut = LoRAConv2d(resnet.conv_shortcut, rank=rank)
 
 
 def _get_target_resnets(unet) -> list:
@@ -310,6 +348,8 @@ def parse_args():
     parser.add_argument("--snr_gamma",                  type=float, default=None)
     parser.add_argument("--noise_offset",               type=float, default=None)
     parser.add_argument("--measurement_dropout",        type=float, default=0.1)
+    parser.add_argument("--lora_rank",                  type=int,   default=4,
+                        help="LoRA rank for ResNet conv layers (0 = full fine-tuning, higher = more params).")
     parser.add_argument("--fit_loss_weight",            type=float, default=0.3)
     parser.add_argument("--fit_loss_boundary_weight",   type=float, default=0.5)
     parser.add_argument("--fit_loss_alpha_threshold",   type=float, default=0.3)
@@ -467,10 +507,18 @@ def main():
     film_channel_dims  = [r.norm2.num_channels for r in target_resnets_raw]
     film_generators    = FiLMGeneratorSet(input_dim=cross_attn_dim, channel_dims=film_channel_dims)
 
+    # ── LoRA wrapping ─────────────────────────────────────────────────────────
+    # Wrap conv1/conv2 (and conv_shortcut when present) in the target ResNet blocks
+    # with low-rank adapters.  This reduces ResNet trainable params from ~206M to ~1.4M
+    # (rank 4), saving ~2 GB of optimizer state.  lora_B is zero-init so the pretrained
+    # baseline is preserved at step 0.
+    if args.lora_rank > 0:
+        _apply_lora_to_resnets(_get_target_resnets(unet), rank=args.lora_rank)
+
     if accelerator.is_main_process:
         print(
             f"FiLM targets: {len(target_resnets_raw)} ResNet blocks "
-            f"(channels: {film_channel_dims})"
+            f"(channels: {film_channel_dims}), LoRA rank={args.lora_rank}"
         )
 
     # ── dtype / device placement ──────────────────────────────────────────────
@@ -481,8 +529,10 @@ def main():
         weight_dtype = torch.bfloat16
 
     vae.to(accelerator.device)
-    text_encoder.to(accelerator.device,   dtype=weight_dtype)
-    text_encoder_2.to(accelerator.device, dtype=weight_dtype)
+    # Keep text encoders on CPU — they are ~2.3 GB and only needed briefly per step.
+    # They are moved to GPU in the training loop just before encoding, then back to CPU.
+    text_encoder.to(dtype=weight_dtype)
+    text_encoder_2.to(dtype=weight_dtype)
     image_encoder.to(accelerator.device,  dtype=weight_dtype)
     unet_encoder.to(accelerator.device,   dtype=weight_dtype)
 
@@ -513,15 +563,26 @@ def main():
     # conv_in: new densepose channels must be learned from scratch
     unet.conv_in.requires_grad_(True)
 
-    # Deepest DownBlock — DownBlock2D has only resnets (no attention), train all
-    unet.down_blocks[-1].requires_grad_(True)
-
-    # MidBlock resnets only — attention layers in mid_block stay frozen
-    for resnet in unet.mid_block.resnets:
-        resnet.requires_grad_(True)
-
-    # First UpBlock — UpBlock2D has only resnets (no attention), train all
-    unet.up_blocks[0].requires_grad_(True)
+    if args.lora_rank > 0:
+        # LoRA mode: selectively unfreeze LoRA A/B weights + small conditioning layers.
+        # The frozen base conv weights inside LoRAConv2d stay frozen.
+        for resnet in _get_target_resnets(unet):
+            resnet.conv1.lora_A.requires_grad_(True)
+            resnet.conv1.lora_B.requires_grad_(True)
+            resnet.conv2.lora_A.requires_grad_(True)
+            resnet.conv2.lora_B.requires_grad_(True)
+            if getattr(resnet, "conv_shortcut", None) is not None:
+                resnet.conv_shortcut.lora_A.requires_grad_(True)
+                resnet.conv_shortcut.lora_B.requires_grad_(True)
+            resnet.time_emb_proj.requires_grad_(True)
+            resnet.norm1.requires_grad_(True)
+            resnet.norm2.requires_grad_(True)
+    else:
+        # Full fine-tuning fallback (--lora_rank 0)
+        unet.down_blocks[-1].requires_grad_(True)
+        for resnet in unet.mid_block.resnets:
+            resnet.requires_grad_(True)
+        unet.up_blocks[0].requires_grad_(True)
 
     measurement_encoder.requires_grad_(True)
     film_generators.requires_grad_(True)
@@ -647,12 +708,10 @@ def main():
 
         unet_unwrapped = accelerator.unwrap_model(unet)
 
-        # Deep UNet blocks (down_blocks[-1], mid_block, up_blocks[0], conv_in)
-        deep_state = torch.load(os.path.join(resume_path, "deep_unet_blocks.pt"), map_location="cpu")
-        unet_unwrapped.down_blocks[-1].load_state_dict(deep_state["down_block_last"])
-        unet_unwrapped.mid_block.load_state_dict(deep_state["mid_block"])
-        unet_unwrapped.up_blocks[0].load_state_dict(deep_state["up_block_first"])
-        unet_unwrapped.conv_in.load_state_dict(deep_state["conv_in"])
+        # Trainable UNet params (LoRA A/B + norms + time_emb_proj + conv_in).
+        # LoRA wrappers are already applied above, so the keys exist in the state dict.
+        unet_lora_state = torch.load(os.path.join(resume_path, "unet_lora.pt"), map_location="cpu")
+        unet_unwrapped.load_state_dict(unet_lora_state, strict=False)
 
         # FiLM generators
         film_state = torch.load(os.path.join(resume_path, "film_generators.pt"), map_location="cpu")
@@ -682,6 +741,10 @@ def main():
 
         menc_unwrapped = accelerator.unwrap_model(measurement_encoder)
         unet_unwrapped = accelerator.unwrap_model(unet)
+
+        # Text encoders are on CPU during training — move them to GPU for validation.
+        text_encoder.to(accelerator.device)
+        text_encoder_2.to(accelerator.device)
 
         with torch.no_grad(), torch.cuda.amp.autocast():
             # Build a TryonPipeline around the current (unwrapped) UNet.
@@ -781,6 +844,11 @@ def main():
             del newpipe
             torch.cuda.empty_cache()
 
+        # Move text encoders back to CPU after validation.
+        text_encoder.to('cpu')
+        text_encoder_2.to('cpu')
+        torch.cuda.empty_cache()
+
     # ── Training loop ─────────────────────────────────────────────────────────
     profiling = args.profile_steps > 0
     profile_step_times = []
@@ -839,6 +907,10 @@ def main():
                 )
                 noisy_latents      = noise_scheduler.add_noise(model_input, noise, timesteps)
                 latent_model_input = torch.cat([noisy_latents, mask, masked_latents, pose_map], dim=1)
+
+                # ── Text encoders: GPU only for the encoding window ───────────
+                text_encoder.to(accelerator.device)
+                text_encoder_2.to(accelerator.device)
 
                 # ── Person text embeddings ────────────────────────────────────
                 text_input_ids = tokenizer(
@@ -903,6 +975,11 @@ def main():
                 enc1_c = text_encoder(text_input_ids_c.to(accelerator.device), output_hidden_states=True)
                 enc2_c = text_encoder_2(text_input_ids_2_c.to(accelerator.device), output_hidden_states=True)
                 text_embeds_cloth = torch.cat([enc1_c.hidden_states[-2], enc2_c.hidden_states[-2]], dim=-1)
+
+                # Encoders no longer needed — move back to CPU to free ~2.3 GB before UNet forward.
+                text_encoder.to('cpu')
+                text_encoder_2.to('cpu')
+                torch.cuda.empty_cache()
 
                 _, reference_features = unet_encoder(cloth_values, timesteps, text_embeds_cloth, return_dict=False)
                 reference_features = list(reference_features)
@@ -1072,15 +1149,11 @@ def main():
 
             unet_unwrapped = accelerator.unwrap_model(unet)
 
-            # Deep UNet blocks — save as a single dict for clean resume
+            # Save only trainable UNet params (LoRA A/B + norms + time_emb_proj + conv_in).
+            # Frozen base weights are not saved — they come from the pretrained checkpoint.
             torch.save(
-                {
-                    "down_block_last":  unet_unwrapped.down_blocks[-1].state_dict(),
-                    "mid_block":        unet_unwrapped.mid_block.state_dict(),
-                    "up_block_first":   unet_unwrapped.up_blocks[0].state_dict(),
-                    "conv_in":          unet_unwrapped.conv_in.state_dict(),
-                },
-                os.path.join(save_path, "deep_unet_blocks.pt"),
+                {k: v.data.cpu() for k, v in unet_unwrapped.named_parameters() if v.requires_grad},
+                os.path.join(save_path, "unet_lora.pt"),
             )
 
             # FiLM generators

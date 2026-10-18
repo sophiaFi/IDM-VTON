@@ -293,7 +293,7 @@ def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
         lr            = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
         lora_rank     = trial.suggest_categorical("lora_rank", [4, 8, 16, 32])
         lora_alpha    = int(lora_rank * trial.suggest_categorical("lora_alpha_ratio", [0.5, 1.0, 2.0]))
-        fit_loss_w    = 0.1
+        fit_loss_w    = 0.3
         menc_dropout  = trial.suggest_float("measurement_dropout", 0.0, 0.2)
         lr_scheduler_type = trial.suggest_categorical(
             "lr_scheduler", ["constant", "cosine"]
