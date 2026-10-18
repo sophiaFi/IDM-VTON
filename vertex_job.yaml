@@ -1,15 +1,13 @@
-# Vertex AI CustomJob spec — passed to --config.
-# The --config flag accepts only the CustomJobSpec fields (workerPoolSpecs,
-# scheduling, …). Top-level job fields like displayName go on the CLI:
+# Vertex AI CustomJob spec
 #
+# Submit with:
 #   gcloud ai custom-jobs create \
-#       --region=<REGION> \
-#       --display-name=idm-vton-profile-run \
+#       --region=europe-west4 \
+#       --display-name=idm-vton-full-run-1 \
 #       --config=vertex_job.yaml
 #
-# After the job finishes, retrieve the profile with:
-#   gsutil cp gs://ma-idm-vton/profile_output/resource_profile.json .
-# Or read it directly from Cloud Logging (it is also printed to stdout).
+# On SPOT preemption the job restarts automatically (disableRetries: false).
+# The startup script detects the latest checkpoint in GCS and resumes from it.
 
 workerPoolSpecs:
   - machineSpec:
@@ -25,14 +23,9 @@ workerPoolSpecs:
         - |
           set -e
 
-          # google-cloud-storage and google-cloud-logging are not in the Dockerfile;
-          # install them here so we can download/upload via GCS and emit structured
-          # logs to Cloud Logging (severity levels, labels, etc.).
           pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
 
-          # Download dataset and checkpoints from GCS to local disk.
-          # Training code uses open() / PIL.Image.open() and from_pretrained()
-          # with local paths, so gs:// URIs cannot be used directly.
+          # Download dataset and model weights
           python - <<'PYEOF'
           from google.cloud import storage
           import pathlib, sys
@@ -56,37 +49,77 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/fit-mini/", "/tmp/fit-mini")
+          download_prefix("datasets/full/train/", "/tmp/full/train")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
 
-          # Run the test training (2 epochs, 200 datapoints).
-          # A100 supports bf16; using it instead of fp16 for better numerical stability.
-          # add --profile_steps 20 \ for profiling only
+          # ── Detect latest checkpoint for auto-resume after preemption ─────────
+          # Writes the GCS path of the latest checkpoint to /tmp/resume_path,
+          # or an empty file if no checkpoint exists (fresh start).
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib
+
+          bucket_name = "ma-idm-vton"
+          prefix      = "full_run_1/checkpoints/"
+
+          client = storage.Client()
+          checkpoint_dirs = set()
+          for blob in client.bucket(bucket_name).list_blobs(prefix=prefix):
+              rel = blob.name[len(prefix):]
+              if rel:
+                  top = rel.split("/")[0]
+                  if top.startswith("checkpoint-"):
+                      checkpoint_dirs.add(top)
+
+          if checkpoint_dirs:
+              latest = max(checkpoint_dirs, key=lambda d: int(d.split("-")[1]))
+              resume_path = f"gs://{bucket_name}/{prefix}{latest}"
+              print(f"Found checkpoint — will resume from {resume_path}")
+          else:
+              resume_path = ""
+              print("No checkpoint found — starting fresh.")
+
+          pathlib.Path("/tmp/resume_path").write_text(resume_path)
+          PYEOF
+
+          # ── Run training ──────────────────────────────────────────────────────
+          RESUME_PATH=$(cat /tmp/resume_path)
+          RESUME_FLAG=""
+          if [ -n "$RESUME_PATH" ]; then
+            RESUME_FLAG="--resume_from_checkpoint $RESUME_PATH"
+          fi
+
           accelerate launch \
             --num_processes=1 \
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_measurements.py \
-            --num_train_epochs 1 \
+            --num_train_epochs 5 \
             --train_batch_size 1 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --height 512 \
             --width 384 \
-            --memory_log_steps 10 \
-            --data_dir /tmp/fit-mini \
+            --data_dir /tmp/full/train \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
             --checkpointing_epoch 1 \
             --gcs_checkpoint_bucket ma-idm-vton \
-            --gcs_checkpoint_prefix test_run_output/checkpoints \
-            --lr_scheduler_type constant
+            --gcs_checkpoint_prefix full_run_1/checkpoints \
+            --learning_rate 2.9729674617925185e-05 \
+            --lora_rank 32 \
+            --lora_alpha 64 \
+            --measurement_dropout 0.18521380443989344 \
+            --lr_scheduler_type constant \
+            --fit_loss_weight 0.1 \
+            --logging_steps 10000 \
+            --memory_log_steps 500 \
+            $RESUME_FLAG
 
-          # Upload any files in /tmp/output (images, checkpoints) to GCS
-          # so they survive container exit.
+          # ── Upload outputs to GCS ─────────────────────────────────────────────
           python - <<'PYEOF'
           from google.cloud import storage
           import pathlib, sys
@@ -100,18 +133,17 @@ workerPoolSpecs:
           for f in out_dir.rglob("*"):
               if f.is_file():
                   rel = f.relative_to(out_dir)
-                  blob_name = f"test_run_output/{rel}".replace("\\", "/")
+                  blob_name = f"full_run_1/{rel}".replace("\\", "/")
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   print(f"  uploaded {blob_name}")
                   uploaded += 1
-          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton/test_run_output/")
+          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton/full_run_1/")
           PYEOF
 
 
 scheduling:
-  # Use preemptible/spot VMs — required to consume the preemptible A100 quota.
-  # A preemptible job can be interrupted, but for a short profiling run this
-  # is acceptable. The job will not be retried if it is preempted or OOMs.
   strategy: SPOT
-  disableRetries: true
+  # Allow automatic restart on SPOT preemption. The startup script detects the
+  # latest checkpoint in gs://ma-idm-vton/full_run_1/checkpoints/ and resumes.
+  disableRetries: false
   restartJobOnWorkerRestart: false
