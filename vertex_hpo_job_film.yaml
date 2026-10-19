@@ -1,0 +1,115 @@
+# Vertex AI CustomJob spec for FiLM hyperparameter optimisation.
+#
+# Submit with:
+#   gcloud ai custom-jobs create \
+#       --region=europe-west4 \
+#       --display-name=idm-vton-film-hpo \
+#       --config=vertex_hpo_job_film.yaml
+#
+# After completion, retrieve results with:
+#   gsutil cp gs://idm-vton-bucket/film_hpo/top3_configs.json .
+#   gsutil cp gs://idm-vton-bucket/film_hpo/all_trials.csv .
+#
+# The Optuna SQLite study is persisted after every trial to
+# gs://idm-vton-bucket/film_hpo/study.db
+# If the job is preempted, resubmit this YAML and the study resumes automatically.
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 200
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v5
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          pip install --quiet \
+            google-cloud-storage==2.14.0 \
+            google-cloud-logging==3.9.0 \
+            optuna==3.6.1 \
+            pandas==2.1.4
+
+          # Download dataset, base model, IP adapter, and HPO script from GCS.
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          bucket_name = "idm-vton-bucket"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+              print(f"Done: gs://{bucket_name}/{prefix} -> {local_root}  ({len(blobs)} files)")
+
+          download_prefix("datasets/hpo/train/",     "/tmp/hpo/train")
+          download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
+          download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
+          download_prefix("scripts/",               "/tmp/scripts")
+          PYEOF
+
+          cp /tmp/scripts/train_hpo_film.py /app/train_hpo_film.py
+
+          # Run Optuna HPO study.
+          # Frozen components are loaded once; trials run sequentially in-process.
+          # The study DB is uploaded to GCS after every trial — resubmit after
+          # preemption and it will resume automatically.
+          python train_hpo_film.py \
+            --data_dir /tmp/hpo/train \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
+            --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            --output_dir /tmp/hpo_output \
+            --height 512 \
+            --width 384 \
+            --mixed_precision bf16 \
+            --n_trials 20 \
+            --max_proxy_steps 1000 \
+            --pruner_min_resource 200 \
+            --val_batches 20 \
+            --seed 0 \
+            --gcs_study_bucket idm-vton-bucket \
+            --gcs_study_prefix film_hpo/study.db
+
+          # Upload full output directory (CSV, JSON, study DB) to GCS.
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          out_dir = pathlib.Path("/tmp/hpo_output")
+          if not out_dir.exists():
+              print("WARNING: /tmp/hpo_output not found.", file=sys.stderr)
+              sys.exit(0)
+          bucket = storage.Client().bucket("idm-vton-bucket")
+          uploaded = 0
+          for f in out_dir.rglob("*"):
+              if f.is_file():
+                  rel = f.relative_to(out_dir)
+                  blob_name = f"film_hpo_output/{rel}".replace("\\", "/")
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  uploaded += 1
+          print(f"Uploaded {uploaded} files to gs://idm-vton-bucket/film_hpo_output/")
+          PYEOF
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
