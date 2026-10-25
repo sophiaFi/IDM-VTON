@@ -16,7 +16,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v3
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v4
       command:
         - /bin/bash
         - -c
@@ -49,7 +49,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/breuni/", "/tmp/breuni")
+          download_prefix("datasets/full/train/", "/tmp/full/train")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
@@ -98,11 +98,12 @@ workerPoolSpecs:
             train_with_measurements.py \
             --num_train_epochs 6 \
             --train_batch_size 1 \
+            --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --height 512 \
             --width 384 \
-            --data_dir /tmp/breuni \
+            --data_dir /tmp/full/train \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
@@ -113,10 +114,12 @@ workerPoolSpecs:
             --lora_rank 32 \
             --lora_alpha 64 \
             --measurement_dropout 0.18521380443989344 \
-            --lr_scheduler_type constant \
-            --fit_loss_weight 0.3 \
+            --lr_scheduler_type cosine \
+            --fit_loss_weight 0.7 \
+            --fit_loss_alpha_threshold 0.15 \
             --logging_steps 10000 \
             --memory_log_steps 500 \
+            --snr_gamma 5.0 \
             $RESUME_FLAG
 
           # ── Upload outputs to GCS ─────────────────────────────────────────────

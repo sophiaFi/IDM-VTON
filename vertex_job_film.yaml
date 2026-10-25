@@ -19,7 +19,7 @@ workerPoolSpecs:
       bootDiskType: pd-ssd
       bootDiskSizeGb: 200
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v5
+      imageUri: us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v6
       command:
         - /bin/bash
         - -c
@@ -97,8 +97,9 @@ workerPoolSpecs:
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_film.py \
-            --num_train_epochs 3 \
+            --num_train_epochs 5 \
             --train_batch_size 1 \
+            --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --use_8bit_adam \
@@ -117,7 +118,9 @@ workerPoolSpecs:
             --learning_rate 6.25683778341919e-05 \
             --lr_scheduler_type cosine \
             --measurement_dropout 0.012045094325853968 \
-            --fit_loss_alpha_threshold 0.5 \
+            --fit_loss_weight 0.7 \
+            --fit_loss_alpha_threshold 0.15 \
+            --snr_gamma 5.0 \
             $RESUME_FLAG
 
           # ── Upload outputs to GCS ─────────────────────────────────────────────
