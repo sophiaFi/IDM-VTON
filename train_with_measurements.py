@@ -664,6 +664,7 @@ def main():
     max_steps = args.profile_steps if profiling else args.max_train_steps
     progress_bar = tqdm(
         range(max_steps), desc="Steps",
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
     )
     train_loss = 0.0
