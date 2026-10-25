@@ -227,8 +227,22 @@ class FITDatasetWithMeasurements(data.Dataset):
 
             keypoints = self.openpose_model(small)
             model_parse, _ = self.parsing_model(small)
+
+            # Torso column mask derived from parsing: upper_clothes (4) + dress (7).
+            # get_mask_location uses this to constrain bust/length expansion to the
+            # torso corridor rather than dilating into arms or background.
+            parse_arr_small = np.array(model_parse)
+            torso_mask_np = (
+                (parse_arr_small == 4) | (parse_arr_small == 7)
+            ).astype(np.uint8) * 255
+
             mask_pil, _ = get_mask_location(
-                "hd", self.garment_category, model_parse, keypoints
+                "hd", self.garment_category, model_parse, keypoints,
+                body_bust_cm=record["body_bust"],
+                garment_bust_cm=record["garment_bust"],
+                garment_length_cm=record["garment_length"],
+                body_height_cm=record["body_height"],
+                densepose_torso_mask=torso_mask_np,
             )
             mask_pil = mask_pil.resize((self.width, self.height))
 
