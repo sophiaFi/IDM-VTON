@@ -52,7 +52,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/fit-mini/", "/tmp/fit-mini")
+          download_prefix("datasets/full/train/", "/tmp/full/train")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
@@ -63,7 +63,7 @@ workerPoolSpecs:
           import pathlib
 
           bucket_name = "idm-vton-bucket"
-          prefix      = "film_run_1/checkpoints/"
+          prefix      = "film_run_full/checkpoints/"
 
           client = storage.Client()
           checkpoint_dirs = set()
@@ -97,23 +97,27 @@ workerPoolSpecs:
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_film.py \
-            --num_train_epochs 1 \
+            --num_train_epochs 3 \
             --train_batch_size 1 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --use_8bit_adam \
-            --lora_rank 4 \
+            --lora_rank 8 \
             --height 512 \
             --width 384 \
-            --data_dir /tmp/fit-mini \
+            --data_dir /tmp/full/train \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
             --checkpointing_epoch 1 \
             --gcs_checkpoint_bucket idm-vton-bucket \
-            --gcs_checkpoint_prefix film_run_1/checkpoints \
+            --gcs_checkpoint_prefix film_run_full/checkpoints \
             --logging_steps 10000 \
             --memory_log_steps 500 \
+            --learning_rate 6.25683778341919e-05 \
+            --lr_scheduler_type cosine \
+            --measurement_dropout 0.012045094325853968 \
+            --fit_loss_alpha_threshold 0.5 \
             $RESUME_FLAG
 
           # ── Upload outputs to GCS ─────────────────────────────────────────────
@@ -130,11 +134,11 @@ workerPoolSpecs:
           for f in out_dir.rglob("*"):
               if f.is_file():
                   rel = f.relative_to(out_dir)
-                  blob_name = f"film_run_1/{rel}".replace("\\", "/")
+                  blob_name = f"film_run_full/{rel}".replace("\\", "/")
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   print(f"  uploaded {blob_name}")
                   uploaded += 1
-          print(f"Done: {uploaded} files uploaded to gs://idm-vton-bucket/film_run_1/")
+          print(f"Done: {uploaded} files uploaded to gs://idm-vton-bucket/film_run_full/")
           PYEOF
 
 
