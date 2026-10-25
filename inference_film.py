@@ -44,8 +44,9 @@ import os
 import sys
 from typing import Optional
 
+import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL
@@ -70,6 +71,52 @@ from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel
 from src.unet_hacked_tryon import UNet2DConditionModel
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _compute_garment_composite_mask(
+    parsing_model,
+    input_pil,
+    result_pil,
+    fallback_mask=None,
+    feather_radius=15,
+    dilation_size=5,
+):
+    """
+    Soft alpha mask (L mode, 0-255; 255 = use generated result) computed by
+    unioning the upper-garment parsing region from the input person image and
+    the generated result, then feathering the boundary.  Falls back to
+    fallback_mask (binary PIL image) if parsing finds no garment in either.
+    """
+    UPPER_GARMENT_LABEL = 4  # ATR label 4 = upper-clothes
+
+    def _parse_garment(pil_img):
+        small = pil_img.resize((384, 512), Image.LANCZOS)
+        parsed, _ = parsing_model(small)
+        arr = np.array(parsed)
+        mask_arr = (arr == UPPER_GARMENT_LABEL).astype(np.uint8) * 255
+        return Image.fromarray(mask_arr, mode='L').resize(pil_img.size, Image.NEAREST)
+
+    mask_input = _parse_garment(input_pil)
+    mask_result = _parse_garment(result_pil)
+    union_arr = np.maximum(np.array(mask_input), np.array(mask_result))
+
+    if union_arr.max() == 0 and fallback_mask is not None:
+        union_arr = np.where(
+            np.array(fallback_mask.convert('L')) > 127, 255, 0
+        ).astype(np.uint8)
+
+    mask_hard = Image.fromarray(union_arr, mode='L')
+    mask = mask_hard
+    if dilation_size > 0:
+        mask = mask.filter(ImageFilter.MaxFilter(size=dilation_size))
+    if feather_radius > 0:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_radius))
+        # Restore the original mask area to full opacity so the blur transition
+        # only occurs in the buffer zone outside the original mask boundary.
+        mask = Image.fromarray(
+            np.maximum(np.array(mask), np.array(mask_hard)), mode='L'
+        )
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -597,25 +644,35 @@ def main():
             result_resized.save(res_path)
             print(f"Saved: {res_path}")
 
+            # Upscale the agnostic mask to crop size (used as fallback if parsing fails).
             mask_crop = Image.fromarray(
                 masks[i, 0].cpu().float().mul(255).byte().numpy()
             ).resize((crop_w, crop_h), Image.NEAREST)
 
-            inv_mask = mask_crop.convert("L").point(lambda p: 0 if p > 127 else 255)
             orig_crop = orig_person.crop((left, top, right, bottom))
-            result_resized.paste(orig_crop, mask=inv_mask)
-            orig_person.paste(result_resized, (left, top))
+
+            # Build a tight compositing mask: union of garment regions parsed from
+            # the input person and the generated result, then feathered at the edges.
+            composite_mask = _compute_garment_composite_mask(
+                parsing_model, orig_crop, result_resized, fallback_mask=mask_crop,
+                feather_radius=15,
+            )
+
+            # Alpha-blend: generated where mask=255, original where mask=0.
+            result_composed = Image.composite(result_resized, orig_crop, composite_mask)
+            orig_person.paste(result_composed, (left, top))
             orig_person.save(out_path)
             print(f"Saved: {out_path}")
 
-            person_vis = ((person_images[i].cpu().float() + 1.0) / 2.0).clamp(0, 1)
-            mask_vis = masks[i, 0].cpu().float()
-            r = (person_vis[0] * (1 - 0.5 * mask_vis) + 0.5 * mask_vis).clamp(0, 1)
-            g = (person_vis[1] * (1 - 0.5 * mask_vis)).clamp(0, 1)
-            b = (person_vis[2] * (1 - 0.5 * mask_vis)).clamp(0, 1)
-            vis_arr = torch.stack([r, g, b], dim=0).permute(1, 2, 0).mul(255).byte().cpu().numpy()
+            # Save inpainting mask as a semi-transparent red overlay on the input crop.
             mask_out = os.path.join(args.output_dir, f"{stem}_mask.png")
-            Image.fromarray(vis_arr).save(mask_out)
+            inpaint_mask_pil = Image.fromarray(
+                masks[i, 0].cpu().float().mul(255).byte().numpy()
+            ).resize((crop_w, crop_h), Image.NEAREST)
+            red_layer = Image.new("RGB", orig_crop.size, (220, 50, 50))
+            alpha = inpaint_mask_pil.point(lambda p: int(p * 0.45))
+            mask_viz = Image.composite(red_layer, orig_crop, alpha)
+            mask_viz.save(mask_out)
             print(f"Saved: {mask_out}")
 
 
