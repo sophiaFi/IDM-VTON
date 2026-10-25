@@ -694,6 +694,12 @@ def main():
 
     if args.resume_from_checkpoint is not None:
         resume_path = args.resume_from_checkpoint
+        # Derive global_step from the original path before any local renaming
+        ckpt_name = os.path.basename(resume_path.rstrip("/\\"))
+        if ckpt_name.startswith("checkpoint-"):
+            global_step = int(ckpt_name.split("-")[1])
+            first_epoch = global_step // num_update_steps_per_epoch
+
         if resume_path.startswith("gs://"):
             without_scheme = resume_path[len("gs://"):]
             bucket_name, gcs_prefix = without_scheme.split("/", 1)
@@ -704,7 +710,7 @@ def main():
             resume_path = local_resume
 
         if accelerator.is_main_process:
-            print(f"Resuming from {resume_path}")
+            print(f"Resuming from {resume_path} (global_step={global_step}, first_epoch={first_epoch})")
 
         unet_unwrapped = accelerator.unwrap_model(unet)
 
@@ -727,11 +733,6 @@ def main():
             optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
         if os.path.exists(sched_path):
             lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
-
-        ckpt_name = os.path.basename(resume_path.rstrip("/\\"))
-        if ckpt_name.startswith("checkpoint-"):
-            global_step = int(ckpt_name.split("-")[1])
-            first_epoch = global_step // num_update_steps_per_epoch
 
     # ── Validation helper ─────────────────────────────────────────────────────
     def _run_validation(tag: str) -> None:
@@ -859,6 +860,7 @@ def main():
     max_steps = args.profile_steps if profiling else args.max_train_steps
     progress_bar = tqdm(
         range(max_steps), desc="Steps",
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
     )
     train_loss      = 0.0
