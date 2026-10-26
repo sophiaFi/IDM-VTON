@@ -16,7 +16,7 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v4
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v5
       command:
         - /bin/bash
         - -c

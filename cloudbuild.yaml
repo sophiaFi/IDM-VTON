@@ -3,11 +3,11 @@ steps:
     args:
       - build
       - -t
-      - us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v6
+      - europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v5
       - .
 
 images:
-  - us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v6
+  - europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v5
 
 options:
   machineType: E2_HIGHCPU_8

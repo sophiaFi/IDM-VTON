@@ -389,7 +389,7 @@ def main():
             )
 
     # ── Load models ───────────────────────────────────────────────────────────
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler", rescale_betas_zero_snr=True)
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
     text_encoder = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder")
@@ -676,8 +676,16 @@ def main():
         if not accelerator.is_main_process:
             return
         menc_unwrapped = accelerator.unwrap_model(measurement_encoder)
+        # Move the training UNet to CPU before copying so the deepcopy happens in
+        # CPU RAM instead of GPU memory.  Without this, two full UNet copies exist
+        # on GPU simultaneously, exhausting VRAM on a 40 GB A100.
+        unet_unwrapped = accelerator.unwrap_model(unet)
+        unet_unwrapped.to("cpu")
+        merged_unet = copy.deepcopy(unet_unwrapped).merge_and_unload()
+        unet_unwrapped.to(accelerator.device)
+        torch.cuda.empty_cache()
         with torch.no_grad(), torch.cuda.amp.autocast():
-            merged_unet = copy.deepcopy(accelerator.unwrap_model(unet)).merge_and_unload()
+            merged_unet = merged_unet.to(accelerator.device, dtype=torch.float16)
             newpipe = TryonPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=merged_unet,
@@ -794,7 +802,7 @@ def main():
             with accelerator.accumulate(unet):
 
                 # ── Validation samples ────────────────────────────────────────
-                if global_step % args.logging_steps == 0:
+                if global_step > 0 and global_step % args.logging_steps == 0:
                     unet.eval()
                     measurement_encoder.eval()
                     _run_validation(tag=str(global_step))
