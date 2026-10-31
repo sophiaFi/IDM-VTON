@@ -16,7 +16,8 @@ class MeasurementEncoder(nn.Module):
         hidden_dim=256,
         output_dim=2048,         # SDXL cross-attention dim (CLIP-L 768 + OpenCLIP 1280)
         dropout=0.1,
-        use_fourier=False        # Optional: Fourier Features (similar to FIT)) #TODO: remove?
+        use_fourier=False,       # Optional: Fourier Features (similar to FIT)
+        fourier_scale=1.0        # std of the random frequencies, in z-score units
     ):
         super().__init__()
 
@@ -24,7 +25,7 @@ class MeasurementEncoder(nn.Module):
         mlp_input_dim = num_measurements
 
         if use_fourier:
-            self.fourier = FourierFeatureProjection(mlp_input_dim, hidden_dim)
+            self.fourier = FourierFeatureProjection(mlp_input_dim, hidden_dim, scale=fourier_scale)
             input_dim = hidden_dim
         else:
             input_dim = mlp_input_dim

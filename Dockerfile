@@ -46,6 +46,7 @@ COPY gradio_demo/densepose/ gradio_demo/densepose/
 COPY train_with_measurements.py .
 COPY train_hpo.py .
 COPY train_with_film.py .
+COPY train_with_measurement_adapter.py .
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/huggingface
