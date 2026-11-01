@@ -53,6 +53,24 @@ from src.unet_hacked_tryon import UNet2DConditionModel
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
+_MEASUREMENT_MASK_KWARGS = (
+    "body_bust_cm", "garment_bust_cm", "garment_length_cm", "body_height_cm", "densepose_torso_mask",
+)
+
+
+def _use_original_idm_vton_mask():
+    """Make FITDatasetWithMeasurements use the unmodified upstream get_mask_location
+    (gradio_demo/utils_mask_original.py): no measurement-driven expansion and the original dilation sizes."""
+    import src.fit_dataset as fit_dataset
+    from utils_mask_original import get_mask_location as upstream_get_mask_location
+
+    def original_get_mask_location(*a, **kw):
+        for k in _MEASUREMENT_MASK_KWARGS:
+            kw.pop(k, None)
+        return upstream_get_mask_location(*a, **kw)
+
+    fit_dataset._import_get_mask_location = lambda: original_get_mask_location
+
 
 def _compute_garment_composite_mask(
     parsing_model,
@@ -187,6 +205,13 @@ def parse_args():
     parser.add_argument(
         "--measurement_scale", type=float, default=1.0,
         help="Multiplier on the trained measurement-attention gates (0 = branch off).",
+    )
+    parser.add_argument(
+        "--original_mask", action="store_true",
+        help=(
+            "Use the original IDM-VTON agnostic mask (no bust/length expansion from the "
+            "measurements). Intended for the baseline run without --checkpoint_dir."
+        ),
     )
     parser.add_argument("--data_dir", type=str, default="data/data_mini_test")
     parser.add_argument("--output_dir", type=str, default="result_adapter")
@@ -423,6 +448,8 @@ def main():
         return _Image.fromarray(vis[:, :, ::-1])
 
     # ── Dataset ───────────────────────────────────────────────────────────────
+    if args.original_mask:
+        _use_original_idm_vton_mask()
     dataset = FITDatasetWithMeasurements(
         data_root=args.data_dir,
         phase="inference",
