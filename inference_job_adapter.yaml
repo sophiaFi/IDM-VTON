@@ -35,9 +35,9 @@ workerPoolSpecs:
           set -e
 
           BUCKET="idm-vton-ma"
-          CHECKPOINT_ROOT="adapter_run_mini/checkpoints"
-          CHECKPOINT_PREFIX="adapter_run_mini/checkpoints/checkpoint-30"
-          OUTPUT_PREFIX="adapter_run_mini/inference_output"
+          CHECKPOINT_ROOT="adapter_run_highres_img/checkpoints"
+          CHECKPOINT_PREFIX="adapter_run_highres_img/checkpoints/checkpoint-30"
+          OUTPUT_PREFIX="adapter_run_highres_img/inference_output"
           MEASUREMENT_SCALE="1.0"
 
           export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
@@ -108,9 +108,9 @@ workerPoolSpecs:
             --data_dir /tmp/inference_test \
             --output_dir /tmp/adapter_inference_output \
             --num_samples -1 \
-            --height 512 \
-            --width 384 \
-            --mixed_precision fp16 \
+            --height 1024 \
+            --width 768 \
+            --mixed_precision bf16 \
             --num_inference_steps 30 \
             --guidance_scale 2.0 \
             --seed 42 \

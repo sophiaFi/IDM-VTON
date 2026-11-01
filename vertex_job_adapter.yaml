@@ -52,7 +52,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/fit-mini/", "/tmp/fit-mini")
+          download_prefix("datasets/fit-mini-highres/", "/tmp/fit-mini-highres")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
@@ -63,7 +63,7 @@ workerPoolSpecs:
           import pathlib
 
           bucket_name = "idm-vton-ma"
-          prefix      = "adapter_run_mini/checkpoints/"
+          prefix      = "adapter_run_highres_img/checkpoints/"
 
           client = storage.Client()
           checkpoint_dirs = set()
@@ -103,15 +103,15 @@ workerPoolSpecs:
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --use_8bit_adam \
-            --height 512 \
-            --width 384 \
-            --data_dir /tmp/fit-mini \
+            --height 1024 \
+            --width 768 \
+            --data_dir /tmp/fit-mini-highres \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
             --checkpointing_epoch 1 \
             --gcs_checkpoint_bucket idm-vton-ma \
-            --gcs_checkpoint_prefix adapter_run_mini/checkpoints \
+            --gcs_checkpoint_prefix adapter_run_highres_img/checkpoints \
             --logging_steps 10000 \
             --memory_log_steps 500 \
             --learning_rate 6.25683778341919e-05 \
@@ -136,11 +136,11 @@ workerPoolSpecs:
           for f in out_dir.rglob("*"):
               if f.is_file():
                   rel = f.relative_to(out_dir)
-                  blob_name = f"adapter_run_mini/{rel}".replace("\\", "/")
+                  blob_name = f"adapter_run_highres_img/{rel}".replace("\\", "/")
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   print(f"  uploaded {blob_name}")
                   uploaded += 1
-          print(f"Done: {uploaded} files uploaded to gs://idm-vton-ma/adapter_run_mini/")
+          print(f"Done: {uploaded} files uploaded to gs://idm-vton-ma/adapter_run_highres_img/")
           PYEOF
 
 

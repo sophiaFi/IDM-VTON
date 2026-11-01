@@ -527,6 +527,11 @@ def main():
                 masks_in = masks
                 garment_images_in = garment_images
 
+            # torch 2.0.1 has no bf16 nearest-interpolate kernel; the pipeline's image/mask
+            # processors resize these tensors, so keep them in fp32 (pipeline casts later).
+            person_input = person_input.float()
+            masks_in = masks_in.float()
+
             images = pipe(
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,

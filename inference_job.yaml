@@ -55,7 +55,7 @@ workerPoolSpecs:
           download_prefix("scripts/",               "/tmp/scripts")
           download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
           import os
-          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "full_run_1/checkpoint-45000") + "/"
+          ckpt_prefix = os.environ.get("CHECKPOINT_PREFIX", "full_run_1/checkpoint-9000") + "/"
           download_prefix(ckpt_prefix, "/tmp/checkpoint")
           PYEOF
 
@@ -77,6 +77,8 @@ workerPoolSpecs:
             --data_dir /tmp/inference_test \
             --output_dir /tmp/full_run_1/inference_output_2 \
             --num_samples -1 \
+            --height 1024 \
+            --width 768 \
             --mixed_precision fp16 \
             --num_inference_steps 30 \
             --guidance_scale 2.0 \
