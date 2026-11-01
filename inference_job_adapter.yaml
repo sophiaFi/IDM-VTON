@@ -1,0 +1,149 @@
+# Vertex AI CustomJob spec for inference_measurement_adapter.py (Extension 3).
+#
+# Usage:
+#   gcloud ai custom-jobs create \
+#       --region=europe-west4 \
+#       --display-name=idm-vton-adapter-inference \
+#       --config=inference_job_adapter.yaml
+#
+# Prerequisites:
+#   - Upload inference_measurement_adapter.py to gs://idm-vton-ma/scripts/
+#     (it is not baked into the image; src/fit_dataset.py and src/measurement_adapter.py are).
+#   - The test data prefix below must contain person/, cloth/ and measurements.json.
+#
+# Results are uploaded to gs://idm-vton-ma/adapter_run_mini/inference_output/.
+#
+# Set CHECKPOINT_PREFIX below to the checkpoint to evaluate. If left empty, the
+# latest checkpoint under CHECKPOINT_ROOT is used.
+# Set MEASUREMENT_SCALE to 0.0 to turn the measurement branch off (sensitivity analysis).
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 200
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/vton-ma/idm-vton/trainer:v7
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          BUCKET="idm-vton-ma"
+          CHECKPOINT_ROOT="adapter_run_mini/checkpoints"
+          CHECKPOINT_PREFIX="adapter_run_mini/checkpoints/checkpoint-30"
+          OUTPUT_PREFIX="adapter_run_mini/inference_output"
+          MEASUREMENT_SCALE="1.0"
+
+          export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
+
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
+
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import os, pathlib, sys
+
+          bucket_name = os.environ["BUCKET"]
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              prefix = prefix.rstrip("/") + "/"
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+                  print(f"  downloaded {blob.name}")
+              print(f"Done: {local_root}  ({len(blobs)} files)")
+
+          ckpt_prefix = os.environ["CHECKPOINT_PREFIX"].rstrip("/")
+          if not ckpt_prefix:
+              root = os.environ["CHECKPOINT_ROOT"].rstrip("/") + "/"
+              dirs = set()
+              for blob in bucket.list_blobs(prefix=root):
+                  top = blob.name[len(root):].split("/")[0]
+                  if top.startswith("checkpoint-"):
+                      dirs.add(top)
+              if not dirs:
+                  print(f"ERROR: no checkpoints found under gs://{bucket_name}/{root}", file=sys.stderr)
+                  sys.exit(1)
+              ckpt_prefix = root + max(dirs, key=lambda d: int(d.split("-")[1]))
+          print(f"Using checkpoint gs://{bucket_name}/{ckpt_prefix}")
+
+          download_prefix("datasets/inference_test/",     "/tmp/inference_test")
+          download_prefix("models/yisol-IDM-VTON", "/tmp/yisol-IDM-VTON")
+          download_prefix("scripts", "/tmp/scripts")
+          download_prefix("ckpt/ip_adapter", "/tmp/ckpt/ip_adapter")
+          download_prefix(ckpt_prefix, "/tmp/checkpoint")
+          PYEOF
+
+          cp /tmp/scripts/inference_measurement_adapter.py /app/inference_measurement_adapter.py
+
+          # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
+          # openpose, and densepose all resolve correctly.
+          mkdir -p /app/ckpt
+          ln -sfn /tmp/yisol-IDM-VTON/humanparsing  /app/ckpt/humanparsing
+          ln -sfn /tmp/yisol-IDM-VTON/densepose     /app/ckpt/densepose
+          ln -sfn /tmp/yisol-IDM-VTON/openpose      /app/ckpt/openpose
+          ln -sfn /tmp/ckpt/ip_adapter              /app/ckpt/ip_adapter
+
+          cd /app
+          accelerate launch \
+            --num_processes=1 \
+            --num_machines=1 \
+            inference_measurement_adapter.py \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
+            --data_dir /tmp/inference_test \
+            --output_dir /tmp/adapter_inference_output \
+            --num_samples -1 \
+            --height 512 \
+            --width 384 \
+            --mixed_precision fp16 \
+            --num_inference_steps 30 \
+            --guidance_scale 2.0 \
+            --seed 42 \
+            --checkpoint_dir /tmp/checkpoint \
+            --measurement_scale "$MEASUREMENT_SCALE" \
+            --ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            --densepose_path /tmp/yisol-IDM-VTON/densepose/model_final_162be9.pkl
+
+          export OUTPUT_PREFIX
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import os, pathlib, sys
+
+          out_dir = pathlib.Path("/tmp/adapter_inference_output")
+          if not out_dir.exists():
+              print("WARNING: inference output directory not found — inference may have failed.", file=sys.stderr)
+              sys.exit(1)
+          prefix = os.environ["OUTPUT_PREFIX"].strip("/")
+          bucket_name = os.environ["BUCKET"]
+          bucket = storage.Client().bucket(bucket_name)
+          uploaded = 0
+          for f in out_dir.rglob("*"):
+              if f.is_file():
+                  rel = f.relative_to(out_dir)
+                  blob_name = f"{prefix}/{rel}".replace("\\", "/")
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  print(f"  uploaded {blob_name}")
+                  uploaded += 1
+          print(f"Done: {uploaded} files uploaded to gs://{bucket_name}/{prefix}/")
+          PYEOF
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
