@@ -47,6 +47,7 @@ COPY train_with_measurements.py .
 COPY train_hpo.py .
 COPY train_with_film.py .
 COPY train_with_measurement_adapter.py .
+COPY train_hpo_measurement_adapter.py .
 
 ENV PYTHONUNBUFFERED=1 \
     HF_HOME=/tmp/huggingface

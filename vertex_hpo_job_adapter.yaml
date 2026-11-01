@@ -1,0 +1,103 @@
+# Vertex AI CustomJob spec for Measurement Adapter (Ext 3) hyperparameter optimisation.
+#
+# Submit with:
+#   gcloud ai custom-jobs create \
+#       --region=europe-west4 \
+#       --display-name=idm-vton-adapter-hpo \
+#       --config=vertex_hpo_job_adapter.yaml
+#
+# After completion, retrieve results with:
+#   gsutil cp gs://idm-vton-ma/adapter_hpo/top3_configs.json .
+#   gsutil cp gs://idm-vton-ma/adapter_hpo/all_trials.csv .
+#
+# The Optuna SQLite study is persisted after every trial to
+# gs://idm-vton-ma/adapter_hpo/study.db
+# If the job is preempted, resubmit this YAML and the study resumes automatically.
+
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 200
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/vton-ma/idm-vton/trainer:v7
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          pip install --quiet \
+            google-cloud-storage==2.14.0 \
+            google-cloud-logging==3.9.0 \
+            optuna==3.6.1 \
+            pandas==2.1.4
+
+          # Download dataset, base model, IP adapter, and HPO script from GCS.
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          bucket_name = "idm-vton-ma"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+              print(f"Done: gs://{bucket_name}/{prefix} -> {local_root}  ({len(blobs)} files)")
+
+          download_prefix("datasets/hpo/train/",     "/tmp/hpo/train")
+          download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
+          download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
+          PYEOF
+
+          # Run Optuna HPO study.
+          # Frozen components are loaded once; trials run sequentially in-process.
+          # The study DB is uploaded to GCS after every trial — resubmit after
+          # preemption and it will resume automatically.
+          python train_hpo_measurement_adapter.py \
+            --data_dir /tmp/hpo/train \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
+            --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            --output_dir /tmp/hpo_output \
+            --height 512 \
+            --width 384 \
+            --mixed_precision bf16 \
+            --n_trials 20 \
+            --max_proxy_steps 1000 \
+            --pruner_min_resource 200 \
+            --val_batches 20 \
+            --report_batches 10 \
+            --batch_size 1 \
+            --gradient_accumulation_steps 6 \
+            --lr_scheduler constant \
+            --num_measurement_tokens 4 \
+            --measurement_token_dim 256 \
+            --snr_gamma 5.0 \
+            --fit_loss_weight 0.7 \
+            --fit_loss_alpha_threshold 0.2 \
+            --seed 0 \
+            --gcs_study_bucket idm-vton-ma \
+            --gcs_study_prefix adapter_hpo/study.db
+          # study.db, all_trials.csv and top3_configs.json are uploaded to
+          # gs://idm-vton-ma/adapter_hpo/ by the script itself.
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: true
+  restartJobOnWorkerRestart: false
