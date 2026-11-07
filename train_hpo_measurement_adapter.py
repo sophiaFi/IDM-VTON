@@ -130,6 +130,16 @@ def _compute_fit_loss(noise_pred, noisy_latents, timesteps, gt_garment_mask,
 # ---------------------------------------------------------------------------
 
 def parse_args():
+    args = _build_parser().parse_args()
+    if args.hpo_round == 2:
+        missing = [n for n in ("fixed_gate_lr_multiplier", "fixed_scale_mode", "fixed_use_fourier",
+                               "fixed_measurement_dropout") if getattr(args, n) is None]
+        if missing:
+            raise SystemExit(f"--hpo_round 2 requires: {', '.join('--' + m for m in missing)}")
+    return args
+
+
+def _build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("--pretrained_model_name_or_path", type=str, default="/tmp/yisol-IDM-VTON")
     p.add_argument("--pretrained_ip_adapter_path",    type=str, default=None)
@@ -156,6 +166,19 @@ def parse_args():
                    help="Constant by default: cosine decays to 0 within the short proxy run and biases lr upwards.")
     p.add_argument("--batch_size", type=int, default=1,
                    help="Micro-batch size (effective batch = batch_size * gradient_accumulation_steps).")
+    # HPO round selection
+    p.add_argument("--hpo_round", type=int, default=1, choices=[1, 2],
+                   help="1: search lr, gate_lr_multiplier, scale_mode, use_fourier, fourier_scale, "
+                        "measurement_dropout (tokens/token_dim/lr_scheduler from CLI). "
+                        "2: fix those to the round-1 top-1 values (--fixed_*) and search lr, "
+                        "num_measurement_tokens, measurement_token_dim, lr_scheduler.")
+    p.add_argument("--study_name", type=str, default="idm_vton_adapter_hpo")
+    p.add_argument("--fixed_gate_lr_multiplier", type=float, default=None)
+    p.add_argument("--fixed_scale_mode", type=str, default=None, choices=["global", "block", "timestep"])
+    p.add_argument("--fixed_use_fourier", action=argparse.BooleanOptionalAction, default=None)
+    p.add_argument("--fixed_fourier_scale", type=float, default=0.25,
+                   help="Only used if --fixed_use_fourier.")
+    p.add_argument("--fixed_measurement_dropout", type=float, default=None)
     # HPO settings
     p.add_argument("--n_trials",          type=int,   default=20)
     p.add_argument("--max_proxy_steps",   type=int,   default=1000,
@@ -174,7 +197,7 @@ def parse_args():
     # GCS study persistence
     p.add_argument("--gcs_study_bucket", type=str, default=None)
     p.add_argument("--gcs_study_prefix", type=str, default="adapter_hpo/study.db")
-    return p.parse_args()
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -456,22 +479,31 @@ def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
     snr_gamma = args.snr_gamma if args.snr_gamma and args.snr_gamma > 0 else None
 
     def objective(trial: optuna.Trial) -> float:
-        lr                  = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
-        gate_lr_mult        = trial.suggest_categorical("gate_lr_multiplier", [1.0, 10.0, 30.0])
-        scale_mode          = trial.suggest_categorical("scale_mode", ["global", "block", "timestep"])
-        use_fourier         = trial.suggest_categorical("use_fourier", [False, True])
-        fourier_scale       = (trial.suggest_float("fourier_scale", 0.1, 1.0, log=True)
-                               if use_fourier else 0.25)
-        menc_dropout        = trial.suggest_float("measurement_dropout", 0.0, 0.2)
-        # Fixed (not searched) to keep the space small for ~30 trials. These are defaults, not
-        # tuned optima: tokens/token_dim should be compared in a follow-up run at the best lr.
-        num_meas_tokens     = args.num_measurement_tokens
-        token_dim           = args.measurement_token_dim
-        lr_scheduler_type   = args.lr_scheduler
+        if args.hpo_round == 1:
+            lr                  = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
+            gate_lr_mult        = trial.suggest_categorical("gate_lr_multiplier", [1.0, 10.0, 30.0])
+            scale_mode          = trial.suggest_categorical("scale_mode", ["global", "block", "timestep"])
+            use_fourier         = trial.suggest_categorical("use_fourier", [False, True])
+            fourier_scale       = (trial.suggest_float("fourier_scale", 0.1, 1.0, log=True)
+                                   if use_fourier else 0.25)
+            menc_dropout        = trial.suggest_float("measurement_dropout", 0.0, 0.2)
+            num_meas_tokens     = args.num_measurement_tokens
+            token_dim           = args.measurement_token_dim
+            lr_scheduler_type   = args.lr_scheduler
+        else:
+            # Round 2: round-1 top-1 values fixed (from CLI), other hyperparameters searched.
+            gate_lr_mult        = args.fixed_gate_lr_multiplier
+            scale_mode          = args.fixed_scale_mode
+            use_fourier         = args.fixed_use_fourier
+            fourier_scale       = args.fixed_fourier_scale
+            menc_dropout        = args.fixed_measurement_dropout
+            lr                  = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
+            num_meas_tokens     = trial.suggest_categorical("num_measurement_tokens", [2, 4, 8])
+            token_dim           = trial.suggest_categorical("measurement_token_dim", [128, 256, 512])
+            lr_scheduler_type   = trial.suggest_categorical("lr_scheduler", ["constant", "cosine"])
         batch_size          = args.batch_size
-        fit_loss_w         = args.fit_loss_weight
+        fit_loss_w          = args.fit_loss_weight
         fit_alpha_threshold = args.fit_loss_alpha_threshold
-        #fit_alpha_threshold = trial.suggest_categorical("fit_loss_alpha_threshold", [0.2, 0.3, 0.5])
 
         torch.manual_seed(args.seed + trial.number)
         device = frozen.device
@@ -708,7 +740,7 @@ def main():
 
     storage = f"sqlite:///{study_db}"
     study = optuna.create_study(
-        study_name="idm_vton_adapter_hpo",
+        study_name=args.study_name,
         direction="minimize",
         sampler=TPESampler(seed=args.seed),
         pruner=HyperbandPruner(
@@ -756,11 +788,12 @@ def main():
         print(f"  Trial #{cfg['trial']}  val_loss={cfg['val_loss']:.6f}  meas_gap={cfg['meas_gap']}  {cfg['params']}")
 
     if args.gcs_study_bucket:
+        results_prefix = os.path.dirname(args.gcs_study_prefix) or "adapter_hpo"
         for fname in ["all_trials.csv", "top3_configs.json"]:
             local = os.path.join(args.output_dir, fname)
             if os.path.exists(local):
-                _gcs_upload(local, args.gcs_study_bucket, f"adapter_hpo/{fname}")
-        print(f"Results uploaded to gs://{args.gcs_study_bucket}/adapter_hpo/")
+                _gcs_upload(local, args.gcs_study_bucket, f"{results_prefix}/{fname}")
+        print(f"Results uploaded to gs://{args.gcs_study_bucket}/{results_prefix}/")
 
 
 if __name__ == "__main__":

@@ -27,18 +27,18 @@ workerPoolSpecs:
       bootDiskType: pd-ssd
       bootDiskSizeGb: 200
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/vton-ma/idm-vton/trainer:v7
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v7
       command:
         - /bin/bash
         - -c
         - |
           set -e
 
-          BUCKET="idm-vton-ma"
-          CHECKPOINT_ROOT="adapter_run_highres_img/checkpoints"
-          CHECKPOINT_PREFIX="adapter_run_highres_img/checkpoints/checkpoint-30"
-          OUTPUT_PREFIX="adapter_run_highres_img/inference_output"
-          MEASUREMENT_SCALE="1.0"
+          BUCKET="ma-idm-vton"
+          CHECKPOINT_ROOT="adapter_run_highres_top3_3/checkpoints"
+          CHECKPOINT_PREFIX="adapter_run_highres_top3_3/checkpoints/checkpoint-2250"
+          OUTPUT_PREFIX="adapter_run_highres_top3_3/inference_output"
+          MEASUREMENT_SCALE="0.8"
 
           export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
 

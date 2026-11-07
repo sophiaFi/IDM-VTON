@@ -1,0 +1,145 @@
+workerPoolSpecs:
+  - machineSpec:
+      machineType: a2-highgpu-1g
+      acceleratorType: NVIDIA_TESLA_A100
+      acceleratorCount: 1
+    replicaCount: 1
+    diskSpec:
+      bootDiskType: pd-ssd
+      bootDiskSizeGb: 200
+    containerSpec:
+      imageUri: us-central1-docker.pkg.dev/vton-ma/idm-vton/trainer:v7
+      command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
+
+          # Download dataset and model weights
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          bucket_name = "idm-vton-ma"
+          client = storage.Client()
+          bucket = client.bucket(bucket_name)
+
+          def download_prefix(prefix, local_root):
+              blobs = list(bucket.list_blobs(prefix=prefix))
+              if not blobs:
+                  print(f"ERROR: no objects found under gs://{bucket_name}/{prefix}", file=sys.stderr)
+                  sys.exit(1)
+              for blob in blobs:
+                  rel = blob.name[len(prefix):]
+                  if not rel:
+                      continue
+                  dest = pathlib.Path(local_root) / rel
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  blob.download_to_filename(str(dest))
+                  print(f"  downloaded {blob.name}")
+              print(f"Done: {local_root}  ({len(blobs)} files)")
+
+          download_prefix("datasets/top_3_highres/train/", "/tmp/top_3_highres/train")
+          download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
+          download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
+          PYEOF
+
+          # ── Detect latest checkpoint for auto-resume after preemption ─────────
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib
+
+          bucket_name = "idm-vton-ma"
+          prefix      = "adapter_run_highres_top3_3/checkpoints/"
+
+          client = storage.Client()
+          checkpoint_dirs = set()
+          for blob in client.bucket(bucket_name).list_blobs(prefix=prefix):
+              rel = blob.name[len(prefix):]
+              if rel:
+                  top = rel.split("/")[0]
+                  if top.startswith("checkpoint-"):
+                      checkpoint_dirs.add(top)
+
+          if checkpoint_dirs:
+              latest = max(checkpoint_dirs, key=lambda d: int(d.split("-")[1]))
+              resume_path = f"gs://{bucket_name}/{prefix}{latest}"
+              print(f"Found checkpoint — will resume from {resume_path}")
+          else:
+              resume_path = ""
+              print("No checkpoint found — starting fresh.")
+
+          pathlib.Path("/tmp/resume_path").write_text(resume_path)
+          PYEOF
+
+          # ── Run training ──────────────────────────────────────────────────────
+          RESUME_PATH=$(cat /tmp/resume_path)
+          RESUME_FLAG=""
+          if [ -n "$RESUME_PATH" ]; then
+            RESUME_FLAG="--resume_from_checkpoint $RESUME_PATH"
+          fi
+
+          accelerate launch \
+            --num_processes=1 \
+            --num_machines=1 \
+            --mixed_precision=bf16 \
+            train_with_measurement_adapter.py \
+            --num_train_epochs 5 \
+            --train_batch_size 1 \
+            --gradient_accumulation_steps 6 \
+            --mixed_precision bf16 \
+            --gradient_checkpointing \
+            --use_8bit_adam \
+            --height 1024 \
+            --width 768 \
+            --data_dir /tmp/top_3_highres/train \
+            --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
+            --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
+            --output_dir /tmp/output \
+            --checkpointing_epoch 1 \
+            --gcs_checkpoint_bucket idm-vton-ma \
+            --gcs_checkpoint_prefix adapter_run_highres_top3_3/checkpoints \
+            --logging_steps 10000 \
+            --memory_log_steps 500 \
+            --learning_rate 0.00016945039949066022 \
+            --lr_scheduler_type cosine \
+            --measurement_dropout 0.027814293527146094 \
+            --fit_loss_weight 0.7 \
+            --fit_loss_alpha_threshold 0.2 \
+            --snr_gamma 5.0 \
+            --gate_lr_multiplier 30.0 \
+            --scale_mode timestep \
+            --use_fourier \
+            --fourier_scale 0.171753430573096 \
+            --num_measurement_tokens 2 \
+            --measurement_token_dim 128 \
+            $RESUME_FLAG
+
+          # ── Upload outputs to GCS ─────────────────────────────────────────────
+          python - <<'PYEOF'
+          from google.cloud import storage
+          import pathlib, sys
+
+          out_dir = pathlib.Path("/tmp/output")
+          if not out_dir.exists():
+              print("WARNING: /tmp/output not found — training may have failed.", file=sys.stderr)
+              sys.exit(0)
+          bucket = storage.Client().bucket("idm-vton-ma")
+          uploaded = 0
+          for f in out_dir.rglob("*"):
+              if f.is_file():
+                  rel = f.relative_to(out_dir)
+                  blob_name = f"adapter_run_highres_top3_3/{rel}".replace("\\", "/")
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  print(f"  uploaded {blob_name}")
+                  uploaded += 1
+          print(f"Done: {uploaded} files uploaded to gs://idm-vton-ma/adapter_run_highres_top3_3/")
+          PYEOF
+
+
+scheduling:
+  strategy: SPOT
+  disableRetries: false
+  restartJobOnWorkerRestart: false

@@ -97,7 +97,7 @@ workerPoolSpecs:
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_measurement_adapter.py \
-            --num_train_epochs 1 \
+            --num_train_epochs 2 \
             --train_batch_size 1 \
             --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
