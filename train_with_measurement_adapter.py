@@ -34,6 +34,7 @@ import math
 from collections import deque
 from typing import List
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -64,7 +65,7 @@ from diffusers.training_utils import compute_snr
 from train_with_film import (
     _setup_cloud_logging, _mem_snapshot,
     _upload_dir_to_gcs, _download_dir_from_gcs,
-    _compute_fit_loss,
+    _compute_fit_loss, _SEG_MEAN as _SEG_MEAN_V, _SEG_STD as _SEG_STD_V,
 )
 
 
@@ -103,6 +104,15 @@ def parse_args():
     parser.add_argument("--fit_loss_alpha_threshold",    type=float, default=0.3)
     parser.add_argument("--segmenter_model",             type=str,
                         default="mattmdjaga/segformer_b2_clothes")
+    # Anchor: keep the measurement branch from changing the garment appearance.
+    parser.add_argument("--anchor_weight", type=float, default=0.0,
+                        help="Weight of MSE(pred_branch_on, stopgrad(pred_branch_off)) inside the garment region. "
+                             "0 disables the anchor (and its extra no-grad UNet forward).")
+    parser.add_argument("--anchor_region", type=str, default="interior", choices=["garment", "interior", "all"],
+                        help="garment: GT garment mask; interior: garment mask eroded by --anchor_erode_px "
+                             "latent pixels (leaves the silhouette free to move); all: whole latent.")
+    parser.add_argument("--anchor_erode_px", type=int, default=3,
+                        help="Erosion radius in latent pixels (8 image px each) for --anchor_region interior.")
     # Measurement encoder / adapter
     parser.add_argument("--encoder_hidden_dim", type=int, default=256)
     parser.add_argument("--encoder_output_dim", type=int, default=512,
@@ -120,8 +130,18 @@ def parse_args():
     parser.add_argument("--gate_lr_multiplier", type=float, default=10.0,
                         help="LR multiplier for the gate parameters (they are excluded from weight decay).")
     # Checkpointing / logging
-    parser.add_argument("--checkpointing_epoch", type=int, default=1)
+    parser.add_argument("--checkpointing_epoch", type=int, default=1,
+                        help="Save a checkpoint every N epochs (0 disables the epoch-end checkpoint).")
+    parser.add_argument("--checkpointing_steps", type=int, default=0,
+                        help="Also save a checkpoint every N optimizer steps (0 disables).")
     parser.add_argument("--logging_steps",        type=int, default=1000)
+    # Validation (generates samples with the measurement branch on and off)
+    parser.add_argument("--val_every_steps", type=int, default=None,
+                        help="Run validation every N optimizer steps (default: --logging_steps).")
+    parser.add_argument("--val_num_batches", type=int, default=1,
+                        help="Number of validation batches (of --test_batch_size) used for the metrics.")
+    parser.add_argument("--val_metrics", action=argparse.BooleanOptionalAction, default=True,
+                        help="Log garment IoU / garment LPIPS for scale 1 vs scale 0 at each validation.")
     # Efficiency
     parser.add_argument("--mixed_precision",   type=str,  default=None, choices=["no", "fp16", "bf16"])
     parser.add_argument("--use_8bit_adam",     action="store_true")
@@ -322,7 +342,7 @@ def main():
 
     # ── Garment segmenter for fit loss ────────────────────────────────────────
     segmenter = None
-    if args.fit_loss_weight > 0:
+    if args.fit_loss_weight > 0 or args.val_metrics:
         segmenter = SegformerForSemanticSegmentation.from_pretrained(args.segmenter_model)
         segmenter.requires_grad_(False)
         segmenter.eval()
@@ -462,6 +482,52 @@ def main():
         if os.path.exists(sched_path):
             lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
 
+    # ── Validation metrics (mirror evaluate.py: SegFormer ids {4,5,7}, torchmetrics VGG LPIPS) ──
+    _val_lpips = {}
+
+    @torch.no_grad()
+    def _val_sample_metrics(gen_pil, target_m11: torch.Tensor, gt_garment_mask: torch.Tensor) -> dict:
+        """gen_pil: generated PIL image; target_m11: [3,H,W] in [-1,1]; gt_garment_mask: [1,H,W] {0,1}."""
+        dev = accelerator.device
+        gen = torch.from_numpy(np.asarray(gen_pil.convert("RGB"))).permute(2, 0, 1).float().div(255).to(dev)
+        tgt = ((target_m11.float() + 1.0) / 2.0).clamp(0, 1).to(dev)
+        gt_mask = gt_garment_mask.float().to(dev)
+        H, W = gen.shape[-2:]
+
+        def seg_mask(img01: torch.Tensor) -> torch.Tensor:
+            x = (img01.unsqueeze(0) - _SEG_MEAN_V.to(dev)) / _SEG_STD_V.to(dev)
+            x = F.interpolate(x, size=(512, 512), mode="bilinear", align_corners=False)
+            logits = segmenter(pixel_values=x).logits.float()
+            logits = F.interpolate(logits, size=(H, W), mode="bilinear", align_corners=False)
+            pred = logits.argmax(dim=1)
+            return sum((pred == lid).float() for lid in (4, 5, 7)).clamp(0, 1)  # [1,H,W]
+
+        def iou(a, b):
+            return ((a * b).sum() / ((a + b).clamp(0, 1).sum() + 1e-8)).item()
+
+        gen_seg, tgt_seg = seg_mask(gen), seg_mask(tgt)
+        out = {
+            # Symmetric (generated vs target, both through SegFormer) = evaluate.py's garment_iou
+            "garment_iou":      iou(gen_seg, tgt_seg),
+            # Generated vs the annotated GT silhouette = what the fit loss optimises
+            "garment_iou_gt":   iou(gen_seg, gt_mask),
+        }
+        if "m" not in _val_lpips and not _val_lpips.get("failed"):
+            try:
+                from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+                _val_lpips["m"] = LearnedPerceptualImagePatchSimilarity(net_type="vgg").to(dev)
+            except Exception as e:  # typically: `lpips` package missing in the image
+                _val_lpips["failed"] = True
+                logger.warning(f"[val-metrics] LPIPS unavailable, logging IoU only: {e!r}")
+        if "m" in _val_lpips:
+            lp = _val_lpips["m"]
+            out["lpips"] = lp((gen * 2 - 1).unsqueeze(0), (tgt * 2 - 1).unsqueeze(0)).item()
+            # Garment-region LPIPS: everything outside the GT garment silhouette zeroed in both images
+            out["garment_lpips"] = lp(
+                (gen * gt_mask * 2 - 1).unsqueeze(0), (tgt * gt_mask * 2 - 1).unsqueeze(0)
+            ).item()
+        return out
+
     # ── Validation helper ─────────────────────────────────────────────────────
     def _run_validation(tag: str) -> None:
         if not accelerator.is_main_process:
@@ -488,10 +554,12 @@ def main():
                 safety_checker=None,
             ).to(accelerator.device)
 
-            for sample in test_dataloader:
+            metric_rows = {"scale1": [], "scale0": []}
+
+            for batch_idx, sample in enumerate(test_dataloader):
+                if batch_idx >= max(1, args.val_num_batches):
+                    break
                 meas = sample["measurements"].to(accelerator.device, dtype=torch.float32)
-                # The pre-hook on the UNet repeats the tokens for classifier-free guidance.
-                adapter_ctx.tokens = _embed_to_tokens(meas, 0.0)
 
                 img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
                 num_prompts  = len(img_emb_list)
@@ -524,39 +592,73 @@ def main():
                         do_classifier_free_guidance=False,
                         negative_prompt=negative_prompt_cloth,
                     )
-                    generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed else None
                     dev = accelerator.device
-                    images = newpipe(
-                        prompt_embeds=prompt_embeds,
-                        negative_prompt_embeds=negative_prompt_embeds,
-                        pooled_prompt_embeds=pooled_prompt_embeds,
-                        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
-                        num_inference_steps=args.num_inference_steps,
-                        generator=generator,
-                        strength=1.0,
-                        pose_img=sample["pose"].to(dev, dtype=torch.float16),
-                        text_embeds_cloth=prompt_embeds_c,
-                        cloth=sample["garment_image"].to(dev, dtype=torch.float16),
-                        mask_image=sample["mask"].to(dev, dtype=torch.float16),
-                        image=((sample["person_image"] + 1.0) / 2.0).to(dev, dtype=torch.float16),
-                        height=args.height,
-                        width=args.width,
-                        guidance_scale=args.guidance_scale,
-                        ip_adapter_image=image_embeds,
-                    )[0]
 
-                adapter_ctx.tokens = None
+                    def _generate(branch_on: bool):
+                        # branch off == ctx.tokens None == measurement_scale 0 at inference.
+                        # The pre-hook on the UNet repeats the tokens for classifier-free guidance.
+                        adapter_ctx.tokens = _embed_to_tokens(meas, 0.0) if branch_on else None
+                        generator = torch.Generator(newpipe.device).manual_seed(args.seed) if args.seed else None
+                        try:
+                            return newpipe(
+                                prompt_embeds=prompt_embeds,
+                                negative_prompt_embeds=negative_prompt_embeds,
+                                pooled_prompt_embeds=pooled_prompt_embeds,
+                                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                                num_inference_steps=args.num_inference_steps,
+                                generator=generator,
+                                strength=1.0,
+                                pose_img=sample["pose"].to(dev, dtype=torch.float16),
+                                text_embeds_cloth=prompt_embeds_c,
+                                cloth=sample["garment_image"].to(dev, dtype=torch.float16),
+                                mask_image=sample["mask"].to(dev, dtype=torch.float16),
+                                image=((sample["person_image"] + 1.0) / 2.0).to(dev, dtype=torch.float16),
+                                height=args.height,
+                                width=args.width,
+                                guidance_scale=args.guidance_scale,
+                                ip_adapter_image=image_embeds,
+                            )[0]
+                        finally:
+                            adapter_ctx.tokens = None
+
+                    images = _generate(True)
+                    torch.cuda.empty_cache()  # release the fp32 VAE-decode buffers before the second pass
+                    images_off = _generate(False) if args.val_metrics else None
+                    torch.cuda.empty_cache()
 
                 for i, img in enumerate(images):
-                    img.save(os.path.join(args.output_dir, f"{tag}_{i}_test.jpg"))
-                    person_np = (
-                        (sample["person_image"][i].cpu().float() + 1.0) / 2.0
-                    ).clamp(0, 1).permute(1, 2, 0).mul(255).byte().numpy()
-                    from PIL import Image as _PILImage
-                    _PILImage.fromarray(person_np).save(
-                        os.path.join(args.output_dir, f"{tag}_{i}_input.jpg")
-                    )
-                break
+                    if batch_idx == 0:
+                        img.save(os.path.join(args.output_dir, f"{tag}_{i}_test.jpg"))
+                        if images_off is not None:
+                            images_off[i].save(os.path.join(args.output_dir, f"{tag}_{i}_scale0.jpg"))
+                        person_np = (
+                            (sample["person_image"][i].cpu().float() + 1.0) / 2.0
+                        ).clamp(0, 1).permute(1, 2, 0).mul(255).byte().numpy()
+                        from PIL import Image as _PILImage
+                        _PILImage.fromarray(person_np).save(
+                            os.path.join(args.output_dir, f"{tag}_{i}_input.jpg")
+                        )
+
+                if args.val_metrics and images_off is not None:
+                    try:
+                        for key, imgs in (("scale1", images), ("scale0", images_off)):
+                            for i, img in enumerate(imgs):
+                                metric_rows[key].append(_val_sample_metrics(
+                                    img, sample["person_image"][i], sample["garment_mask"][i],
+                                ))
+                    except Exception as e:  # metrics must never kill training
+                        logger.warning(f"[val-metrics] skipped for batch {batch_idx}: {e!r}")
+
+            if args.val_metrics and metric_rows["scale1"] and metric_rows["scale0"]:
+                payload = {}
+                for key, rows in metric_rows.items():
+                    for name in rows[0]:
+                        payload[f"val/{name}_{key}"] = float(np.mean([r[name] for r in rows]))
+                for name in metric_rows["scale1"][0]:
+                    payload[f"val/{name}_delta"] = payload[f"val/{name}_scale1"] - payload[f"val/{name}_scale0"]
+                accelerator.log(payload, step=global_step)
+                logger.info(f"[val-metrics] tag={tag} step={global_step} n={len(metric_rows['scale1'])} "
+                            + "  ".join(f"{k}={v:.4f}" for k, v in payload.items()))
 
             del newpipe
             torch.cuda.empty_cache()
@@ -564,6 +666,28 @@ def main():
         text_encoder.to('cpu')
         text_encoder_2.to('cpu')
         torch.cuda.empty_cache()
+
+    def _save_checkpoint(step: int) -> None:
+        if not accelerator.is_main_process:
+            return
+        save_path = os.path.join(args.output_dir, f"checkpoint-{step}")
+        os.makedirs(save_path, exist_ok=True)
+
+        torch.save(
+            {k: v.data.cpu() for k, v in unet_raw.named_parameters() if v.requires_grad},
+            os.path.join(save_path, "unet_lora.pt"),
+        )
+        torch.save(adapter_raw.state_dict(), os.path.join(save_path, "measurement_adapter.pt"))
+        torch.save(menc_raw.state_dict(),    os.path.join(save_path, "measurement_encoder.pt"))
+        with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
+            json.dump(adapter_config, f, indent=2)
+        torch.save(optimizer.state_dict(),    os.path.join(save_path, "optimizer.pt"))
+        torch.save(lr_scheduler.state_dict(), os.path.join(save_path, "lr_scheduler.pt"))
+
+        if args.gcs_checkpoint_bucket:
+            ckpt_folder = os.path.basename(save_path)
+            gcs_prefix  = f"{args.gcs_checkpoint_prefix}/{ckpt_folder}"
+            _upload_dir_to_gcs(save_path, args.gcs_checkpoint_bucket, gcs_prefix)
 
     # ── Training loop ─────────────────────────────────────────────────────────
     profiling = args.profile_steps > 0
@@ -580,6 +704,9 @@ def main():
     )
     train_loss     = 0.0
     train_fit_loss = 0.0
+    train_anchor_loss = 0.0
+    last_val_step = -1
+    last_ckpt_step = global_step if args.resume_from_checkpoint else -1
     adapter_grad_norm_accum = 0.0
     menc_grad_norm_accum    = 0.0
 
@@ -593,7 +720,9 @@ def main():
             with accelerator.accumulate(unet):
 
                 # ── Validation samples ────────────────────────────────────────
-                if global_step > 0 and global_step % args.logging_steps == 0:
+                if (global_step > 0 and global_step != last_val_step
+                        and global_step % (args.val_every_steps or args.logging_steps) == 0):
+                    last_val_step = global_step  # global_step stays constant across accumulation micro-batches
                     unet.eval()
                     measurement_encoder.eval()
                     measurement_adapter.eval()
@@ -692,6 +821,22 @@ def main():
                 _, reference_features = unet_encoder(cloth_values, timesteps, text_embeds_cloth, return_dict=False)
                 reference_features = list(reference_features)
 
+                # ── Anchor target: same forward with the measurement branch off (no grad) ──
+                # conv_in is shared, so this isolates the effect of the measurement branch only.
+                # The pre-hook recomputes active_tokens/gates on every forward, so restoring
+                # ctx.tokens afterwards is enough for the main (checkpointed) forward.
+                noise_pred_off = None
+                if args.anchor_weight > 0:
+                    meas_tokens = adapter_ctx.tokens
+                    adapter_ctx.tokens = None
+                    with torch.no_grad():
+                        noise_pred_off = unet(
+                            latent_model_input, timesteps, encoder_hidden_states,
+                            added_cond_kwargs=unet_added_cond_kwargs,
+                            garment_features=reference_features,
+                        ).sample
+                    adapter_ctx.tokens = meas_tokens
+
                 # ── TryonNet forward (measurement branch active in every attn2) ──
                 noise_pred = unet(
                     latent_model_input, timesteps, encoder_hidden_states,
@@ -737,11 +882,30 @@ def main():
                     )
                     loss = loss + args.fit_loss_weight * fit_loss
 
+                if noise_pred_off is not None:
+                    if args.anchor_region == "all":
+                        region = torch.ones_like(mask)
+                    else:
+                        region = F.interpolate(
+                            batch["garment_mask"].to(accelerator.device).float(),
+                            size=mask.shape[-2:], mode="nearest",
+                        )
+                        if args.anchor_region == "interior" and args.anchor_erode_px > 0:
+                            k = 2 * args.anchor_erode_px + 1
+                            region = -F.max_pool2d(-region, kernel_size=k, stride=1, padding=k // 2)
+                    sq_err = (noise_pred.float() - noise_pred_off.float().detach()).pow(2)
+                    denom = (region.sum() * sq_err.shape[1]).clamp(min=1.0)
+                    anchor_loss = (sq_err * region).sum() / denom
+                    loss = loss + args.anchor_weight * anchor_loss
+
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 if args.fit_loss_weight > 0:
                     avg_fit_loss = accelerator.gather(fit_loss.repeat(args.train_batch_size)).mean()
                     train_fit_loss += avg_fit_loss.item() / args.gradient_accumulation_steps
+                if noise_pred_off is not None:
+                    avg_anchor = accelerator.gather(anchor_loss.detach().repeat(args.train_batch_size)).mean()
+                    train_anchor_loss += avg_anchor.item() / args.gradient_accumulation_steps
 
                 accelerator.backward(loss)
 
@@ -766,6 +930,12 @@ def main():
 
                     progress_bar.update(1)
                     global_step += 1
+
+                    if (args.checkpointing_steps > 0 and global_step % args.checkpointing_steps == 0
+                            and global_step != last_ckpt_step):
+                        _save_checkpoint(global_step)
+                        last_ckpt_step = global_step
+
                     if profiling:
                         if torch.cuda.is_available():
                             torch.cuda.synchronize()
@@ -787,11 +957,14 @@ def main():
                     }
                     if args.fit_loss_weight > 0:
                         log_payload["train_fit_loss"] = train_fit_loss
+                    if args.anchor_weight > 0:
+                        log_payload["train_anchor_loss"] = train_anchor_loss
                     if snap:
                         log_payload.update({k: v for k, v in snap.items() if "peak" not in k})
                     accelerator.log(log_payload, step=global_step)
                     train_loss     = 0.0
                     train_fit_loss = 0.0
+                    train_anchor_loss = 0.0
                     menc_grad_norm_accum    = 0.0
                     adapter_grad_norm_accum = 0.0
 
@@ -844,25 +1017,10 @@ def main():
             break
 
         # ── Checkpoint ────────────────────────────────────────────────────────
-        if epoch % args.checkpointing_epoch == 0 and accelerator.is_main_process:
-            save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-            os.makedirs(save_path, exist_ok=True)
-
-            torch.save(
-                {k: v.data.cpu() for k, v in unet_raw.named_parameters() if v.requires_grad},
-                os.path.join(save_path, "unet_lora.pt"),
-            )
-            torch.save(adapter_raw.state_dict(), os.path.join(save_path, "measurement_adapter.pt"))
-            torch.save(menc_raw.state_dict(),    os.path.join(save_path, "measurement_encoder.pt"))
-            with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
-                json.dump(adapter_config, f, indent=2)
-            torch.save(optimizer.state_dict(),    os.path.join(save_path, "optimizer.pt"))
-            torch.save(lr_scheduler.state_dict(), os.path.join(save_path, "lr_scheduler.pt"))
-
-            if args.gcs_checkpoint_bucket:
-                ckpt_folder = os.path.basename(save_path)
-                gcs_prefix  = f"{args.gcs_checkpoint_prefix}/{ckpt_folder}"
-                _upload_dir_to_gcs(save_path, args.gcs_checkpoint_bucket, gcs_prefix)
+        epoch_ckpt_due = args.checkpointing_epoch > 0 and epoch % args.checkpointing_epoch == 0
+        if epoch_ckpt_due and global_step != last_ckpt_step:
+            _save_checkpoint(global_step)
+            last_ckpt_step = global_step
 
     # ── Final validation ──────────────────────────────────────────────────────
     unet.eval()

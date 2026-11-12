@@ -19,21 +19,21 @@ workerPoolSpecs:
       bootDiskType: pd-ssd
       bootDiskSizeGb: 200
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/vton-ma/idm-vton/trainer:v7
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v8
       command:
         - /bin/bash
         - -c
         - |
           set -e
 
-          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0
+          pip install --quiet google-cloud-storage==2.14.0 google-cloud-logging==3.9.0 lpips
 
           # Download dataset and model weights
           python - <<'PYEOF'
           from google.cloud import storage
           import pathlib, sys
 
-          bucket_name = "idm-vton-ma"
+          bucket_name = "ma-idm-vton"
           client = storage.Client()
           bucket = client.bucket(bucket_name)
 
@@ -52,7 +52,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/fit-mini-highres/", "/tmp/fit-mini-highres")
+          download_prefix("datasets/full_highres/train/", "/tmp/full_highres/train")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("ckpt/ip_adapter/", "/tmp/ckpt/ip_adapter")
           PYEOF
@@ -62,8 +62,8 @@ workerPoolSpecs:
           from google.cloud import storage
           import pathlib
 
-          bucket_name = "idm-vton-ma"
-          prefix      = "adapter_run_highres_img/checkpoints/"
+          bucket_name = "ma-idm-vton"
+          prefix      = "adapter_run_anchor_full/checkpoints/"
 
           client = storage.Client()
           checkpoint_dirs = set()
@@ -97,7 +97,7 @@ workerPoolSpecs:
             --num_machines=1 \
             --mixed_precision=bf16 \
             train_with_measurement_adapter.py \
-            --num_train_epochs 2 \
+            --num_train_epochs 5 \
             --train_batch_size 1 \
             --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
@@ -105,21 +105,33 @@ workerPoolSpecs:
             --use_8bit_adam \
             --height 1024 \
             --width 768 \
-            --data_dir /tmp/fit-mini-highres \
+            --data_dir /tmp/full_highres/train \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
             --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
             --output_dir /tmp/output \
             --checkpointing_epoch 1 \
-            --gcs_checkpoint_bucket idm-vton-ma \
-            --gcs_checkpoint_prefix adapter_run_highres_img/checkpoints \
+            --checkpointing_steps 500 \
+            --gcs_checkpoint_bucket ma-idm-vton \
+            --gcs_checkpoint_prefix adapter_run_anchor_full/checkpoints \
             --logging_steps 10000 \
+            --val_every_steps 500 \
+            --test_batch_size 1 \
+            --val_num_batches 12 \
             --memory_log_steps 500 \
-            --learning_rate 6.25683778341919e-05 \
+            --learning_rate 0.00010289760686796055 \
             --lr_scheduler_type constant \
-            --measurement_dropout 0.012045094325853968 \
-            --fit_loss_weight 0.7 \
-            --fit_loss_alpha_threshold 0.2 \
+            --measurement_dropout 0.027814293527146094 \
+            --fit_loss_weight 0.4 \
+            --fit_loss_alpha_threshold 0.4 \
+            --anchor_weight 3.0 \
+            --anchor_region interior \
             --snr_gamma 5.0 \
+            --gate_lr_multiplier 30.0 \
+            --scale_mode timestep \
+            --use_fourier \
+            --fourier_scale 0.171753430573096 \
+            --num_measurement_tokens 4 \
+            --measurement_token_dim 256 \
             $RESUME_FLAG
 
           # ── Upload outputs to GCS ─────────────────────────────────────────────
@@ -131,16 +143,16 @@ workerPoolSpecs:
           if not out_dir.exists():
               print("WARNING: /tmp/output not found — training may have failed.", file=sys.stderr)
               sys.exit(0)
-          bucket = storage.Client().bucket("idm-vton-ma")
+          bucket = storage.Client().bucket("ma-idm-vton")
           uploaded = 0
           for f in out_dir.rglob("*"):
               if f.is_file():
                   rel = f.relative_to(out_dir)
-                  blob_name = f"adapter_run_highres_img/{rel}".replace("\\", "/")
+                  blob_name = f"adapter_run_anchor_full/{rel}".replace("\\", "/")
                   bucket.blob(blob_name).upload_from_filename(str(f))
                   print(f"  uploaded {blob_name}")
                   uploaded += 1
-          print(f"Done: {uploaded} files uploaded to gs://idm-vton-ma/adapter_run_highres_img/")
+          print(f"Done: {uploaded} files uploaded to gs://ma-idm-vton/adapter_run_anchor_full/")
           PYEOF
 
 
