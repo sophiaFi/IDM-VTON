@@ -116,7 +116,7 @@ workerPoolSpecs:
             --measurement_dropout 0.18521380443989344 \
             --lr_scheduler_type cosine \
             --fit_loss_weight 0.7 \
-            --fit_loss_alpha_threshold 0.15 \
+            --fit_loss_alpha_threshold 0.3 \
             --logging_steps 10000 \
             --memory_log_steps 500 \
             --snr_gamma 5.0 \

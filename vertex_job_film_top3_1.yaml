@@ -99,6 +99,7 @@ workerPoolSpecs:
             train_with_film.py \
             --num_train_epochs 5 \
             --train_batch_size 1 \
+            --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --use_8bit_adam \
@@ -117,7 +118,7 @@ workerPoolSpecs:
             --learning_rate 6.25683778341919e-05 \
             --lr_scheduler_type cosine \
             --measurement_dropout 0.012045094325853968 \
-            --fit_loss_alpha_threshold 0.5 \
+            --fit_loss_alpha_threshold 0.3 \
             $RESUME_FLAG
 
           # ── Upload outputs to GCS ─────────────────────────────────────────────

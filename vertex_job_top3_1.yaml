@@ -69,6 +69,7 @@ workerPoolSpecs:
             train_with_measurements.py \
             --num_train_epochs 5 \
             --train_batch_size 1 \
+            --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
             --height 512 \

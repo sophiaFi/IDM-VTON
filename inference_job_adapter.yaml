@@ -41,8 +41,8 @@ workerPoolSpecs:
           MEASUREMENT_SCALE="1.0"
           # Chunking: process dataset indices [START_INDEX, END_INDEX). END_INDEX=-1 -> to the end.
           # Each chunk uploads to its own subfolder so chunks never overwrite each other.
-          START_INDEX=0
-          END_INDEX=300
+          START_INDEX=600
+          END_INDEX=1000
           OUTPUT_PREFIX="$OUTPUT_PREFIX/chunk_${START_INDEX}_${END_INDEX}"
 
           export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
@@ -151,6 +151,6 @@ workerPoolSpecs:
 
 
 scheduling:
-  strategy: STANDARD
-  disableRetries: true
+  strategy: SPOT
+  disableRetries: false
   restartJobOnWorkerRestart: false

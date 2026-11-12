@@ -397,7 +397,7 @@ def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
         lr                  = trial.suggest_float("lr", 1e-5, 2e-4, log=True)
         lora_rank           = trial.suggest_categorical("lora_rank", [4, 8, 16])
         fit_loss_w          = 0.3
-        fit_alpha_threshold = trial.suggest_categorical("fit_loss_alpha_threshold", [0.2, 0.3, 0.5])
+        fit_alpha_threshold = 0.3 #trial.suggest_categorical("fit_loss_alpha_threshold", [0.2, 0.3, 0.5])
         menc_dropout        = trial.suggest_float("measurement_dropout", 0.0, 0.2)
         lr_scheduler_type   = trial.suggest_categorical("lr_scheduler", ["constant", "cosine"])
         batch_size          = trial.suggest_categorical("batch_size", [1, 2])

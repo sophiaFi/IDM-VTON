@@ -88,8 +88,8 @@ workerPoolSpecs:
             --num_measurement_tokens 4 \
             --measurement_token_dim 256 \
             --snr_gamma 5.0 \
-            --fit_loss_weight 0.7 \
-            --fit_loss_alpha_threshold 0.2 \
+            --fit_loss_weight 0.3 \
+            --fit_loss_alpha_threshold 0.3 \
             --seed 0 \
             --gcs_study_bucket idm-vton-ma \
             --gcs_study_prefix adapter_hpo/study.db

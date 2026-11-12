@@ -119,7 +119,7 @@ workerPoolSpecs:
             --lr_scheduler_type cosine \
             --measurement_dropout 0.012045094325853968 \
             --fit_loss_weight 0.7 \
-            --fit_loss_alpha_threshold 0.15 \
+            --fit_loss_alpha_threshold 0.3 \
             --snr_gamma 5.0 \
             $RESUME_FLAG
 

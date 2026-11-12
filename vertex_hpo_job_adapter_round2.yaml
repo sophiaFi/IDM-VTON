@@ -66,7 +66,6 @@ workerPoolSpecs:
           download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
           PYEOF
 
-          # TODO: replace the --fixed_* values with the round-1 top-1 configuration
           # (gs://idm-vton-ma/adapter_hpo/top3_configs.json). For use_fourier use
           # --use_fourier / --no-use_fourier semantics: --fixed_use_fourier or --no-fixed_use_fourier.
           python train_hpo_measurement_adapter.py \
@@ -92,8 +91,8 @@ workerPoolSpecs:
             --batch_size 1 \
             --gradient_accumulation_steps 6 \
             --snr_gamma 5.0 \
-            --fit_loss_weight 0.7 \
-            --fit_loss_alpha_threshold 0.2 \
+            --fit_loss_weight 0.3 \
+            --fit_loss_alpha_threshold 0.3 \
             --seed 0 \
             --gcs_study_bucket idm-vton-ma \
             --gcs_study_prefix adapter_hpo_round2a/study.db

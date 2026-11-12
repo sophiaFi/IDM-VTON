@@ -156,7 +156,7 @@ def _build_parser():
     p.add_argument("--snr_gamma", type=float, default=5.0,
                    help="Min-SNR gamma for the training loss. <=0 disables it.")
     p.add_argument("--fit_loss_weight", type=float, default=0.7)
-    p.add_argument("--fit_loss_alpha_threshold", type=float, default=0.2)
+    p.add_argument("--fit_loss_alpha_threshold", type=float, default=0.3)
     p.add_argument("--encoder_hidden_dim", type=int, default=256)
     p.add_argument("--encoder_output_dim", type=int, default=512)
     p.add_argument("--num_timestep_bins", type=int, default=10)

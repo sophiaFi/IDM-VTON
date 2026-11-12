@@ -122,7 +122,7 @@ workerPoolSpecs:
             --lr_scheduler_type constant \
             --measurement_dropout 0.027814293527146094 \
             --fit_loss_weight 0.4 \
-            --fit_loss_alpha_threshold 0.4 \
+            --fit_loss_alpha_threshold 0.3 \
             --anchor_weight 3.0 \
             --anchor_region interior \
             --snr_gamma 5.0 \
