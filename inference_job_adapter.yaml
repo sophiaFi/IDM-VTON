@@ -27,7 +27,7 @@ workerPoolSpecs:
       bootDiskType: pd-ssd
       bootDiskSizeGb: 200
     containerSpec:
-      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v7
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v8
       command:
         - /bin/bash
         - -c
@@ -35,10 +35,15 @@ workerPoolSpecs:
           set -e
 
           BUCKET="ma-idm-vton"
-          CHECKPOINT_ROOT="adapter_run_highres_top3_3/checkpoints"
-          CHECKPOINT_PREFIX="adapter_run_highres_top3_3/checkpoints/checkpoint-2250"
-          OUTPUT_PREFIX="adapter_run_highres_top3_3/inference_output"
-          MEASUREMENT_SCALE="0.8"
+          CHECKPOINT_ROOT="adapter_run_anchor_full/checkpoints"
+          CHECKPOINT_PREFIX="adapter_run_anchor_full/checkpoints/checkpoint-7500"
+          OUTPUT_PREFIX="adapter_run_anchor_full/inference_output"
+          MEASUREMENT_SCALE="1.0"
+          # Chunking: process dataset indices [START_INDEX, END_INDEX). END_INDEX=-1 -> to the end.
+          # Each chunk uploads to its own subfolder so chunks never overwrite each other.
+          START_INDEX=0
+          END_INDEX=300
+          OUTPUT_PREFIX="$OUTPUT_PREFIX/chunk_${START_INDEX}_${END_INDEX}"
 
           export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
 
@@ -82,7 +87,7 @@ workerPoolSpecs:
               ckpt_prefix = root + max(dirs, key=lambda d: int(d.split("-")[1]))
           print(f"Using checkpoint gs://{bucket_name}/{ckpt_prefix}")
 
-          download_prefix("datasets/inference_test/",     "/tmp/inference_test")
+          download_prefix("datasets/full_highres/test/",     "/tmp/full_highres/test")
           download_prefix("models/yisol-IDM-VTON", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts", "/tmp/scripts")
           download_prefix("ckpt/ip_adapter", "/tmp/ckpt/ip_adapter")
@@ -105,9 +110,11 @@ workerPoolSpecs:
             --num_machines=1 \
             inference_measurement_adapter.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/inference_test \
+            --data_dir /tmp/full_highres/test \
             --output_dir /tmp/adapter_inference_output \
             --num_samples -1 \
+            --start_index "$START_INDEX" \
+            --end_index "$END_INDEX" \
             --height 1024 \
             --width 768 \
             --mixed_precision bf16 \
@@ -144,6 +151,6 @@ workerPoolSpecs:
 
 
 scheduling:
-  strategy: SPOT
+  strategy: STANDARD
   disableRetries: true
   restartJobOnWorkerRestart: false

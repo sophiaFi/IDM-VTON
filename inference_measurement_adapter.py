@@ -217,6 +217,10 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="result_adapter")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="Number of dataset samples to process. -1 = all.")
+    parser.add_argument("--start_index", type=int, default=0,
+                        help="First dataset index to process (for splitting a run into chunks).")
+    parser.add_argument("--end_index", type=int, default=-1,
+                        help="Dataset index to stop before (exclusive). -1 = until the end.")
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--height", type=int, default=682)
     parser.add_argument("--num_inference_steps", type=int, default=30)
@@ -458,9 +462,12 @@ def main():
         openpose_model=openpose_model,
         densepose_fn=densepose_fn,
     )
+    end = len(dataset) if args.end_index < 0 else min(args.end_index, len(dataset))
     if args.num_samples > 0:
-        indices = list(range(min(args.num_samples, len(dataset))))
-        dataset = torch.utils.data.Subset(dataset, indices)
+        end = min(end, args.start_index + args.num_samples)
+    if args.start_index > 0 or end < len(dataset):
+        dataset = torch.utils.data.Subset(dataset, list(range(args.start_index, end)))
+        print(f"Processing dataset indices [{args.start_index}, {end})")
 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 
