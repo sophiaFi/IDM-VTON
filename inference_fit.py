@@ -424,8 +424,10 @@ def main():
         densepose_fn=densepose_fn,
     )
     if args.num_samples > 0:
-        indices = list(range(min(args.num_samples, len(dataset))))
-        dataset = torch.utils.data.Subset(dataset, indices)
+        end = min(end, args.start_index + args.num_samples)
+    if args.start_index > 0 or end < len(dataset):
+        dataset = torch.utils.data.Subset(dataset, list(range(args.start_index, end)))
+        print(f"Processing dataset indices [{args.start_index}, {end})")
 
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
 

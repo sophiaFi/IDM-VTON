@@ -131,7 +131,7 @@ workerPoolSpecs:
           from google.cloud import storage
           import os, pathlib, sys
 
-          out_dir = pathlib.Path("/tmp/adapter_inference_output")
+          out_dir = pathlib.Path("/tmp/adapter_inference_output_breuni")
           if not out_dir.exists():
               print("WARNING: inference output directory not found — inference may have failed.", file=sys.stderr)
               sys.exit(1)

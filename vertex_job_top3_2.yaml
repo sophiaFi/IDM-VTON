@@ -72,8 +72,8 @@ workerPoolSpecs:
             --gradient_accumulation_steps 6 \
             --mixed_precision bf16 \
             --gradient_checkpointing \
-            --height 512 \
-            --width 384 \
+            --height 1024 \
+            --width 768 \
             --memory_log_steps 10 \
             --data_dir /tmp/top_3/train \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
