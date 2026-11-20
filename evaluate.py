@@ -8,12 +8,15 @@ Usage — compare a result folder against ground truth:
         --data_dir data/data_mini_test \\
         --output_dir eval_output
 
-    # With measurement counterfactual sensitivity test (requires checkpoint):
+    # With measurement counterfactual analysis. First generate the +/- sigma images with any of the
+    # three inference scripts (inference_fit.py / inference_film.py / inference_measurement_adapter.py):
+    python inference_film.py --data_dir data/data_mini_test --checkpoint_dir output/checkpoint-500 \\
+        --output_dir result_film --num_samples 8 --counterfactual --cf_sigma 2.0
+    # then analyse them (reads result_film/cf/<dimension>/<stem>_{plus,minus}.png):
     python evaluate.py \\
-        --result_dir result_fit \\
+        --result_dir result_film \\
         --data_dir data/data_mini_test \\
-        --checkpoint_dir output/checkpoint-500 \\
-        --counterfactual \\
+        --cf_dir result_film/cf \\
         --output_dir eval_output
 
 Computed metrics (following docs/evaluation.md):
@@ -34,17 +37,11 @@ Computed metrics (following docs/evaluation.md):
     clip_sim   — CLIP ViT-B/32 cosine similarity of generated vs. target
     dino_sim   — DINO ViT-S/8 cosine similarity outside garment region
 
-  Identity preservation:
-    face_cos   — ArcFace-style face embedding cosine similarity (optional,
-                 requires insightface; skipped when not installed)
-
-  Pose consistency:
-    pose_dist  — mean Euclidean distance of OpenPose keypoints (optional,
-                 requires dwpose or openpose; skipped when not installed)
-
-  Measurement controllability (--counterfactual flag):
-    For each measurement dimension, vary it by ±2σ while keeping everything
-    else fixed and measure how the output garment mask changes. -> execute on GPU
+  Measurement controllability (--cf_dir):
+    For each base measurement, the inference scripts generate ±σ variants with everything else
+    (inputs, seed, steps) fixed; the derived ease features are recomputed consistently. This script
+    segments the garment in each pair and reports the |area| change plus the signed change in area,
+    bbox height and bbox width.
 
 All per-sample results are written to <output_dir>/results.csv.
 A summary JSON is written to <output_dir>/summary.json.
@@ -579,238 +576,93 @@ MEASUREMENT_NAMES = [
 ]
 
 
-def counterfactual_sensitivity(
-    checkpoint_dir: str,
-    data_dir: str,
-    device: torch.device,
-    sigma_range: float = 2.0,
-    num_samples: int = 4,
-    seed: int = 42,
-    height: int = 682,
-    width: int = 512,
-) -> dict:
+def _garment_extent(mask: torch.Tensor):
+    """(area, bbox_height, bbox_width) of a [1,H,W] binary mask, as fractions of the image size."""
+    m = mask.squeeze(0) > 0.5
+    H, W = m.shape
+    area = m.float().mean().item()
+    if not m.any():
+        return area, 0.0, 0.0
+    rows = torch.where(m.any(dim=1))[0]
+    cols = torch.where(m.any(dim=0))[0]
+    return area, (rows[-1] - rows[0] + 1).item() / H, (cols[-1] - cols[0] + 1).item() / W
+
+
+def counterfactual_from_images(cf_dir: str, device: torch.device) -> dict:
     """
-    For each measurement dimension, generate images at +sigma_range and -sigma_range
-    (all other dimensions held at their dataset values) and compute the mean absolute
-    change in the segmented garment mask area.  Returns a dict keyed by dimension name.
+    Analyse the +/- sigma images written by `inference_*.py --counterfactual`
+    (<cf_dir>/<dimension>/<stem>_{plus,minus}.png). Everything except one measurement is identical
+    between the pair (same inputs, seed and steps), so differences in the SegFormer garment mask are
+    attributable to that measurement. Per dimension, over samples:
+      mean/std_mask_area_delta : |area(+) - area(-)|             (magnitude of the response)
+      signed_*                 : value(+) - value(-) for area, bbox height and bbox width
+                                 (direction; positive = larger measurement -> larger garment)
     """
-    import random
-    from diffusers import AutoencoderKL
-    from peft import PeftModel
-    from transformers import (
-        AutoTokenizer,
-        CLIPImageProcessor,
-        CLIPTextModel,
-        CLIPTextModelWithProjection,
-        CLIPVisionModelWithProjection,
-    )
+    cf_dir = Path(cf_dir)
+    meta_path = cf_dir / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
 
-    from ip_adapter.ip_adapter import Resampler
-    from src.fit_dataset import FITDatasetWithMeasurements
-    from src.measurement_encoder import MeasurementEncoder
-    from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
-    from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
-    from src.unet_hacked_tryon import UNet2DConditionModel
-    from torch.utils.data import DataLoader
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    dtype = torch.float16 if "cuda" in str(device) else torch.float32
-
-    base_model = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-
-    tokenizer   = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer", use_fast=False)
-    tokenizer_2 = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer_2", use_fast=False)
-    text_encoder   = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder").to(device, dtype=dtype)
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(base_model, subfolder="text_encoder_2").to(device, dtype=dtype)
-    vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae").to(device, dtype=dtype)
-    image_encoder = CLIPVisionModelWithProjection.from_pretrained("ckpt/image_encoder").to(device, dtype=dtype)
-
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", subfolder="unet").to(device, dtype=dtype)
-    unet_encoder.config.addition_embed_type = None
-    unet_encoder.config["addition_embed_type"] = None
-    unet_encoder.requires_grad_(False)
-
-    unet = UNet2DConditionModel.from_pretrained(base_model, subfolder="unet", low_cpu_mem_usage=False, device_map=None)
-    unet.config.encoder_hid_dim = image_encoder.config.hidden_size
-    unet.config.encoder_hid_dim_type = "ip_image_proj"
-
-    ip_path = "ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin"
-    ip_state = torch.load(ip_path, map_location="cpu")
-    import torch.nn as nn
-    adapter_modules = nn.ModuleList(unet.attn_processors.values())
-    adapter_modules.load_state_dict(ip_state["ip_adapter"], strict=True)
-
-    image_proj_model = Resampler(
-        dim=image_encoder.config.hidden_size, depth=4, dim_head=64, heads=20,
-        num_queries=16, embedding_dim=image_encoder.config.hidden_size,
-        output_dim=unet.config.cross_attention_dim, ff_mult=4,
-    ).to(device, dtype=torch.float32)
-    image_proj_model.load_state_dict(ip_state["image_proj"], strict=True)
-    unet.encoder_hid_proj = image_proj_model
-
-    # expand conv_in 9→13 (same logic as inference_fit.py)
-    old = unet.conv_in
-    conv_new = nn.Conv2d(13, old.out_channels, old.kernel_size, padding=old.padding)
-    nn.init.zeros_(conv_new.weight)
-    conv_new.weight.data[:, :old.in_channels] = old.weight.data
-    conv_new.bias.data = old.bias.data
-    unet.conv_in = conv_new
-    unet.config["in_channels"] = 13
-    unet.config.in_channels = 13
-
-    unet = PeftModel.from_pretrained(unet, os.path.join(checkpoint_dir, "lora"))
-    unet = unet.merge_and_unload()
-    conv_state = torch.load(os.path.join(checkpoint_dir, "conv_in.pt"), map_location="cpu")
-    unet.conv_in.load_state_dict(conv_state)
-    unet = unet.to(device, dtype=dtype)
-    unet.requires_grad_(False)
-
-    menc = MeasurementEncoder(num_measurements=7, hidden_dim=256,
-                               output_dim=unet.config.cross_attention_dim).to(device)
-    menc.load_state_dict(torch.load(os.path.join(checkpoint_dir, "measurement_encoder.pt"), map_location="cpu"))
-    menc.eval()
-
-    pipe = TryonPipeline.from_pretrained(
-        base_model, unet=unet, unet_encoder=unet_encoder, vae=vae,
-        tokenizer=tokenizer, tokenizer_2=tokenizer_2,
-        text_encoder=text_encoder, text_encoder_2=text_encoder_2,
-        image_encoder=image_encoder, feature_extractor=CLIPImageProcessor(),
-        torch_dtype=dtype, add_watermarker=False, safety_checker=None,
-    ).to(device)
-    pipe.set_progress_bar_config(disable=True)
-
-    dataset = FITDatasetWithMeasurements(data_root=data_dir, phase="test", size=(height, width))
-    indices = list(range(min(num_samples, len(dataset))))
-    loader = DataLoader(torch.utils.data.Subset(dataset, indices), batch_size=1, shuffle=False)
-
-    def _pad(t: torch.Tensor, multiple: int = 8):
-        """Pad [B,C,H,W] so H and W are multiples of `multiple`; return (padded, (ph, pw))."""
-        _, _, h, w = t.shape
-        ph = (multiple - h % multiple) % multiple
-        pw = (multiple - w % multiple) % multiple
-        if ph == 0 and pw == 0:
-            return t, (0, 0)
-        return F.pad(t, (0, pw, 0, ph), mode="reflect"), (ph, pw)
-
-    pipe_h = height + (8 - height % 8) % 8
-    pipe_w = width  + (8 - width  % 8) % 8
-    pad_h  = pipe_h - height
-    pad_w  = pipe_w - width
-
-    def generate(batch, measurements_override):
-        person_images  = batch["person_image"].to(device, dtype=dtype)
-        garment_images = batch["garment_image"].to(device, dtype=dtype)
-        garment_clips  = batch["garment_image_clip"]
-        pose_imgs      = batch["pose"].to(device, dtype=dtype)
-        masks          = batch["mask"].to(device, dtype=dtype)
-        prompts        = list(batch["text_prompts"])
-        prompts_cloth  = list(batch["text_prompts_cloth"])
-        bsz = person_images.shape[0]
-        neg = ["monochrome, lowres, bad anatomy, worst quality, low quality"] * bsz
-        image_embeds = torch.cat([garment_clips[i] for i in range(bsz)], dim=0).to(device, dtype=dtype)
-        with torch.no_grad():
-            prompt_embeds, neg_embeds, pooled, neg_pooled = pipe.encode_prompt(
-                prompts, num_images_per_prompt=1,
-                do_classifier_free_guidance=True, negative_prompt=neg,
-            )
-            (cloth_embeds, _, _, _) = pipe.encode_prompt(
-                prompts_cloth, num_images_per_prompt=1,
-                do_classifier_free_guidance=False, negative_prompt=neg,
-            )
-            m = measurements_override.to(device, dtype=torch.float32)
-            m_tok = menc(m).to(dtype=prompt_embeds.dtype)
-            null_tok = torch.zeros_like(m_tok)
-            prompt_embeds = torch.cat([prompt_embeds, m_tok], dim=1)
-            neg_embeds    = torch.cat([neg_embeds,    null_tok], dim=1)
-
-            person_input = (person_images + 1.0) / 2.0
-            if pad_h > 0 or pad_w > 0:
-                person_input, _  = _pad(person_input)
-                pose_imgs_in, _  = _pad(pose_imgs)
-                masks_in, _      = _pad(masks)
-                garment_in, _    = _pad(garment_images)
-            else:
-                pose_imgs_in = pose_imgs
-                masks_in     = masks
-                garment_in   = garment_images
-
-            images = pipe(
-                prompt_embeds=prompt_embeds, negative_prompt_embeds=neg_embeds,
-                pooled_prompt_embeds=pooled, negative_pooled_prompt_embeds=neg_pooled,
-                num_inference_steps=2, generator=torch.Generator(device).manual_seed(seed),
-                strength=1.0, pose_img=pose_imgs_in, text_embeds_cloth=cloth_embeds,
-                cloth=garment_in, mask_image=masks_in, image=person_input,
-                height=pipe_h, width=pipe_w, guidance_scale=2.0,
-                ip_adapter_image=image_embeds,
-            )[0]
-
-            if pad_h > 0 or pad_w > 0:
-                images = [img.crop((0, 0, width, height)) for img in images]
-
-        return images[0]
-
-    dim_results = {name: [] for name in MEASUREMENT_NAMES}
-    total_steps = num_samples * len(MEASUREMENT_NAMES)
-
-    with tqdm(total=total_steps, desc="Counterfactual") as pbar:
-      for batch in loader:
-        m_base = batch["measurements"].clone()
-        for dim_idx, dim_name in enumerate(MEASUREMENT_NAMES):
-            pbar.set_postfix(dim=dim_name)
-            m_plus  = m_base.clone(); m_plus[:, dim_idx]  += sigma_range
-            m_minus = m_base.clone(); m_minus[:, dim_idx] -= sigma_range
-
-            img_plus  = generate(batch, m_plus)
-            img_minus = generate(batch, m_minus)
-            pbar.update(1)
-
-            # Measure change in garment mask area using SegFormer
-            mask_plus  = segment_garment_mask(img_plus,  device)
-            mask_minus = segment_garment_mask(img_minus, device)
-            if mask_plus is not None and mask_minus is not None:
-                area_plus  = mask_plus.mean().item()
-                area_minus = mask_minus.mean().item()
-                dim_results[dim_name].append(abs(area_plus - area_minus))
-
-    return {
-        name: {
-            "mean_mask_area_delta": float(np.mean(v)) if v else float("nan"),
-            "std_mask_area_delta":  float(np.std(v))  if v else float("nan"),
+    results = {"sigma": meta.get("sigma")}
+    for name in MEASUREMENT_NAMES:
+        dim_dir = cf_dir / name
+        if not dim_dir.exists():
+            continue
+        abs_area, d_area, d_h, d_w = [], [], [], []
+        for plus_path in sorted(dim_dir.glob("*_plus.png")):
+            minus_path = plus_path.with_name(plus_path.name.replace("_plus.png", "_minus.png"))
+            if not minus_path.exists():
+                continue
+            a_p, h_p, w_p = _garment_extent(segment_garment_mask(load_image_rgb(str(plus_path)), device))
+            a_m, h_m, w_m = _garment_extent(segment_garment_mask(load_image_rgb(str(minus_path)), device))
+            abs_area.append(abs(a_p - a_m))
+            d_area.append(a_p - a_m)
+            d_h.append(h_p - h_m)
+            d_w.append(w_p - w_m)
+        n = len(abs_area)
+        results[name] = {
+            "n_samples": n,
+            "mean_mask_area_delta": float(np.mean(abs_area)) if n else float("nan"),
+            "std_mask_area_delta":  float(np.std(abs_area))  if n else float("nan"),
+            "signed_area_delta":    float(np.mean(d_area))   if n else float("nan"),
+            "signed_height_delta":  float(np.mean(d_h))      if n else float("nan"),
+            "signed_width_delta":   float(np.mean(d_w))      if n else float("nan"),
         }
-        for name, v in dim_results.items()
-    }
+    return results
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
+def print_counterfactual(cf: dict):
+    print(f"\n── Counterfactual sensitivity (±{cf.get('sigma')}σ) ──────────────────────────────")
+    print(f"  {'Dimension':<24} {'n':>3}  {'|Δarea|':>9} {'±std':>8}  {'Δarea':>9} {'Δheight':>9} {'Δwidth':>9}")
+    for name, v in cf.items():
+        if not isinstance(v, dict):
+            continue
+        print(f"  {name:<24} {v['n_samples']:>3}  {v['mean_mask_area_delta']:9.5f} {v['std_mask_area_delta']:8.5f}"
+              f"  {v['signed_area_delta']:9.5f} {v['signed_height_delta']:9.5f} {v['signed_width_delta']:9.5f}")
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate IDM-VTON generated images.")
-    p.add_argument("--result_dir", type=str, required=True,
-                   help="Directory containing generated images (*_result.png).")
-    p.add_argument("--data_dir",   type=str, required=True,
-                   help="Dataset root (contains target/, agnostic-mask/, garment-mask/, measurements.json).")
+    p.add_argument("--result_dir", type=str, default=None,
+                   help="Directory containing generated images (*_result.png). "
+                        "Optional if only --cf_dir is given (counterfactual-only analysis).")
+    p.add_argument("--data_dir",   type=str, default=None,
+                   help="Dataset root (contains target/, agnostic-mask/, garment-mask/, measurements.json). "
+                        "Optional if only --cf_dir is given.")
     p.add_argument("--output_dir", type=str, default="eval_output",
                    help="Where to write results.csv, summary.json, and visuals/.")
-    p.add_argument("--height", type=int, default=682)
-    p.add_argument("--width",  type=int, default=512)
+    p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--width",  type=int, default=768)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--no_visuals", action="store_true",
                    help="Skip saving side-by-side comparison images.")
-    p.add_argument("--counterfactual", action="store_true",
-                   help="Run measurement controllability test (requires --checkpoint_dir).")
-    p.add_argument("--checkpoint_dir", type=str, default=None,
-                   help="Checkpoint directory for counterfactual sensitivity test.")
-    p.add_argument("--cf_samples", type=int, default=4,
-                   help="Number of samples for counterfactual test.")
-    p.add_argument("--cf_sigma", type=float, default=2.0,
-                   help="Sigma offset for counterfactual perturbation.")
+    p.add_argument("--cf_dir", type=str, default=None,
+                   help="Counterfactual image dir written by inference_*.py --counterfactual "
+                        "(<output_dir>/cf). Enables the measurement controllability analysis.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -824,6 +676,17 @@ def main():
     vis_dir = out_dir / "visuals"
     if not args.no_visuals:
         vis_dir.mkdir(exist_ok=True)
+
+    if args.cf_dir and not (args.result_dir and args.data_dir):
+        print("Analysing counterfactual images …")
+        cf = counterfactual_from_images(args.cf_dir, device)
+        cf_path = out_dir / "counterfactual.json"
+        cf_path.write_text(json.dumps(cf, indent=2))
+        print(f"Counterfactual results → {cf_path}")
+        print_counterfactual(cf)
+        return
+    if not (args.result_dir and args.data_dir):
+        sys.exit("--result_dir and --data_dir are required unless only --cf_dir is given.")
 
     pairs = find_pairs(args.result_dir, args.data_dir)
     if not pairs:
@@ -935,22 +798,9 @@ def main():
     agg.update(dist_metrics)
 
     # ── Counterfactual sensitivity ─────────────────────────────────────────────
-    if args.counterfactual:
-        if args.checkpoint_dir is None:
-            print("--counterfactual requires --checkpoint_dir; skipping.")
-        else:
-            print("Running counterfactual sensitivity test …")
-            cf_results = counterfactual_sensitivity(
-                checkpoint_dir=args.checkpoint_dir,
-                data_dir=args.data_dir,
-                device=device,
-                sigma_range=args.cf_sigma,
-                num_samples=args.cf_samples,
-                seed=args.seed,
-                height=args.height,
-                width=args.width,
-            )
-            agg["counterfactual"] = cf_results
+    if args.cf_dir:
+        print("Analysing counterfactual images …")
+        agg["counterfactual"] = counterfactual_from_images(args.cf_dir, device)
 
     # ── Write outputs ──────────────────────────────────────────────────────────
     import csv
@@ -973,11 +823,7 @@ def main():
             print(f"  {k:<28} {v:8.4f}  ± {std:.4f}")
 
     if "counterfactual" in agg:
-        print("\n── Counterfactual sensitivity ───────────────────────────────────────")
-        print(f"  {'Dimension':<30}  {'mean Δmask':>12}  {'std':>8}")
-        for name, vals in agg["counterfactual"].items():
-            print(f"  {name:<30}  {vals['mean_mask_area_delta']:12.6f}  {vals['std_mask_area_delta']:8.6f}")
-
+        print_counterfactual(agg["counterfactual"])
 
 if __name__ == "__main__":
     main()

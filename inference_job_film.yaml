@@ -17,7 +17,12 @@ workerPoolSpecs:
       acceleratorCount: 1
     replicaCount: 1
     containerSpec:
-      imageUri: us-central1-docker.pkg.dev/idm-vton-proj/idm-vton/trainer:v6
+      imageUri: europe-west4-docker.pkg.dev/breuni-brtn-dev/idm-vton/trainer:v8
+      env:
+        # First dataset index to process. Set to the number of images already
+        # uploaded to resume an interrupted run (outputs go to the same GCS prefix).
+        - name: START_INDEX
+          value: "0"
       command:
         - /bin/bash
         - -c
@@ -30,7 +35,7 @@ workerPoolSpecs:
           from google.cloud import storage
           import pathlib, sys
 
-          bucket_name = "idm-vton-bucket"
+          bucket_name = "ma-idm-vton"
           client = storage.Client()
           bucket = client.bucket(bucket_name)
 
@@ -49,7 +54,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/inference_test/",     "/tmp/inference_test")
+          download_prefix("datasets/breuni/",     "/tmp/breuni")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts/",               "/tmp/scripts")
           download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
@@ -59,6 +64,7 @@ workerPoolSpecs:
           PYEOF
 
           cp /tmp/scripts/inference_film.py /app/inference_film.py
+          cp /tmp/scripts/counterfactual.py /app/src/counterfactual.py
 
           # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
           # openpose, and densepose all resolve correctly.
@@ -68,14 +74,71 @@ workerPoolSpecs:
           ln -sfn /tmp/yisol-IDM-VTON/openpose      /app/ckpt/openpose
           ln -sfn /tmp/ckpt/ip_adapter              /app/ckpt/ip_adapter
 
+          # Background uploader: syncs new outputs to GCS every 100 finished images
+          # (counted via *_mask.png, the last file written per image), then does a
+          # final sync once /tmp/inference_done appears.
+          cat > /tmp/upload_outputs.py <<'PYEOF'
+          import pathlib, sys, time
+          from google.cloud import storage
+
+          out_dir = pathlib.Path(sys.argv[1])
+          bucket_name = sys.argv[2]
+          prefix = sys.argv[3].strip("/")
+          every = int(sys.argv[4])
+          sentinel = pathlib.Path("/tmp/inference_done")
+
+          bucket = storage.Client().bucket(bucket_name)
+          uploaded = {}
+
+          def upload_new(settle):
+              n = 0
+              for f in out_dir.rglob("*"):
+                  if not f.is_file():
+                      continue
+                  mtime = f.stat().st_mtime
+                  if uploaded.get(f) == mtime:
+                      continue
+                  if settle and time.time() - mtime < 5:
+                      continue
+                  blob_name = f"{prefix}/{f.relative_to(out_dir).as_posix()}"
+                  bucket.blob(blob_name).upload_from_filename(str(f))
+                  uploaded[f] = mtime
+                  n += 1
+              return n
+
+          next_at = every
+          while True:
+              if sentinel.exists():
+                  if not out_dir.exists():
+                      print("WARNING: inference output directory not found - inference may have failed.", file=sys.stderr)
+                      sys.exit(1)
+                  n = upload_new(False)
+                  print(f"Final upload: {n} new files; {len(uploaded)} total in gs://{bucket_name}/{prefix}/", flush=True)
+                  break
+              count = len(list(out_dir.glob("*_mask.png"))) if out_dir.exists() else 0
+              if count >= next_at:
+                  try:
+                      n = upload_new(True)
+                      print(f"Checkpoint upload at {count} images: {n} new files -> gs://{bucket_name}/{prefix}/", flush=True)
+                      next_at = (count // every + 1) * every
+                  except Exception as e:
+                      print(f"WARNING: periodic upload failed, will retry: {e}", file=sys.stderr, flush=True)
+              time.sleep(20)
+          PYEOF
+
+          rm -f /tmp/inference_done
+          python -u /tmp/upload_outputs.py /tmp/film_run_full/inference_output_breuni ma-idm-vton film_run_full/inference_output_breuni 100 &
+          UPLOADER_PID=$!
+
           accelerate launch \
             --num_processes=1 \
             --num_machines=1 \
             inference_film.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/inference_test \
-            --output_dir /tmp/film_run_full/inference_output_2 \
+            --data_dir /tmp/breuni \
+            --output_dir /tmp/film_run_full/inference_output_breuni \
             --num_samples -1 \
+            --start_index "${START_INDEX:-0}" \
             --height 1024 \
             --width 768 \
             --mixed_precision fp16 \

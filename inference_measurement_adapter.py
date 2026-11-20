@@ -46,6 +46,7 @@ from src.measurement_adapter import (
     MeasurementAdapter, MeasurementAdapterContext,
     get_hidden_sizes, install_measurement_adapter,
 )
+from src.counterfactual import add_counterfactual_args, iter_batches, save_if_counterfactual
 from src.measurement_encoder import MeasurementEncoder
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
@@ -239,6 +240,7 @@ def parse_args():
         "--parsing_gpu_id", type=int, default=0,
         help="GPU id passed to Parsing and OpenPose constructors.",
     )
+    add_counterfactual_args(parser)
     return parser.parse_args()
 
 
@@ -474,7 +476,7 @@ def main():
     negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
     # ── Inference loop ────────────────────────────────────────────────────────
-    for batch in dataloader:
+    for batch in iter_batches(dataloader, args):
         person_images = batch["person_image"].to(device, dtype=weight_dtype)
         garment_images = batch["garment_image"].to(device, dtype=weight_dtype)
         garment_clips = batch["garment_image_clip"]
@@ -563,6 +565,9 @@ def main():
 
             if pad_h > 0 or pad_w > 0:
                 images = [img.crop((0, 0, args.width, args.height)) for img in images]
+
+        if save_if_counterfactual(batch, images, args.output_dir):
+            continue
 
         crop_boxes = batch["person_crop_box"]
         input_person_filenames = batch["input_person_filename"]
