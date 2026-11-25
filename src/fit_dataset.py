@@ -149,6 +149,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         self.norm = transforms.Normalize([0.5], [0.5])
         self.clip_processor = CLIPImageProcessor()
         self.flip_transform = transforms.RandomHorizontalFlip(p=1)
+        self._mask_inputs = {}  # index -> (model_parse, keypoints, torso_mask_np), inference phase only
 
         with open(os.path.join(data_root, "measurements.json"), "r") as f:
             self.records = json.load(f)
@@ -163,6 +164,25 @@ class FITDatasetWithMeasurements(data.Dataset):
 
     def __len__(self):
         return len(self.records)
+
+    def _extended_mask_pil(self, index, body_bust_cm, garment_bust_cm, garment_length_cm, body_height_cm):
+        model_parse, keypoints, torso_mask_np = self._mask_inputs[index]
+        mask_pil, _ = _import_get_mask_location()(
+            "hd", self.garment_category, model_parse, keypoints,
+            body_bust_cm=body_bust_cm,
+            garment_bust_cm=garment_bust_cm,
+            garment_length_cm=garment_length_cm,
+            body_height_cm=body_height_cm,
+            densepose_torso_mask=torso_mask_np,
+        )
+        return mask_pil.resize((self.width, self.height))
+
+    def extended_mask(self, index, body_bust_cm, garment_bust_cm, garment_length_cm, body_height_cm):
+        """Binary [1, H, W] inpainting mask for custom measurements (cm); needs a prior __getitem__(index)."""
+        mask_pil = self._extended_mask_pil(
+            index, body_bust_cm, garment_bust_cm, garment_length_cm, body_height_cm
+        )
+        return (self.to_tensor(mask_pil)[:1] >= 0.5).float()
 
     def __getitem__(self, index):
         record = self.records[index]
@@ -220,8 +240,6 @@ class FITDatasetWithMeasurements(data.Dataset):
             # mirroring the logic in preprocess_fit.py.  The person image used here
             # is the input person (wearing a *different* garment), not the target,
             # so the mask and pose match what is available at inference time.
-            get_mask_location = _import_get_mask_location()
-
             # OpenPose and Parsing both expect 384×512
             small = input_person_pil.resize((384, 512))
 
@@ -236,15 +254,15 @@ class FITDatasetWithMeasurements(data.Dataset):
                 (parse_arr_small == 4) | (parse_arr_small == 7)
             ).astype(np.uint8) * 255
 
-            mask_pil, _ = get_mask_location(
-                "hd", self.garment_category, model_parse, keypoints,
+            # Kept so the extended mask can be rebuilt for counterfactual measurements.
+            self._mask_inputs[index] = (model_parse, keypoints, torso_mask_np)
+            mask_pil = self._extended_mask_pil(
+                index,
                 body_bust_cm=record["body_bust"],
                 garment_bust_cm=record["garment_bust"],
                 garment_length_cm=record["garment_length"],
                 body_height_cm=record["body_height"],
-                densepose_torso_mask=torso_mask_np,
             )
-            mask_pil = mask_pil.resize((self.width, self.height))
 
             densepose_pil = self.densepose_fn(small).resize((self.width, self.height))
 
@@ -344,6 +362,7 @@ class FITDatasetWithMeasurements(data.Dataset):
                 "person_crop_box": list(person_crop_box),  # [left, top, right, bottom]
                 "person_original_size": [orig_w, orig_h],  # [W, H]
                 "input_person_filename": person_name,
+                "sample_index": index,
             }
 
         return {
