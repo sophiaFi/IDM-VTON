@@ -39,6 +39,7 @@ Example (after training):
 """
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -46,11 +47,12 @@ from typing import Optional
 
 import numpy as np
 import torch
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageOps
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL
 from torch.utils.data import DataLoader
+from torch.utils.data.dataloader import default_collate
 from transformers import (
     AutoTokenizer,
     CLIPImageProcessor,
@@ -532,7 +534,9 @@ def main():
         parsing_model=parsing_model,
         openpose_model=openpose_model,
         densepose_fn=densepose_fn,
+        skip_undetected=True,
     )
+    base_dataset = dataset
     end = len(dataset) if args.end_index < 0 else min(args.end_index, len(dataset))
     if args.num_samples > 0:
         end = min(end, args.start_index + args.num_samples)
@@ -540,12 +544,19 @@ def main():
         dataset = torch.utils.data.Subset(dataset, list(range(args.start_index, end)))
         print(f"Processing dataset indices [{args.start_index}, {end})")
 
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    def collate_skip_none(items):
+        return None if items[0] is None else default_collate(items)
+
+    dataloader = DataLoader(
+        dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_skip_none,
+    )
 
     negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
     # ── Inference loop ────────────────────────────────────────────────────────
     for batch in iter_batches(dataloader, args):
+        if batch is None:
+            continue
         person_images = batch["person_image"].to(device, dtype=weight_dtype)
         garment_images = batch["garment_image"].to(device, dtype=weight_dtype)
         garment_clips = batch["garment_image_clip"]
@@ -647,9 +658,9 @@ def main():
             crop_w = right - left
             crop_h = bottom - top
 
-            orig_person = Image.open(
+            orig_person = ImageOps.exif_transpose(Image.open(
                 os.path.join(args.data_dir, input_person_filenames[i])
-            ).convert("RGB")
+            )).convert("RGB")
             result_resized = img.resize((crop_w, crop_h), Image.LANCZOS)
 
             res_path = os.path.join(args.output_dir, f"{stem}_generated.png")
@@ -686,6 +697,13 @@ def main():
             mask_viz = Image.composite(red_layer, orig_crop, alpha)
             mask_viz.save(mask_out)
             print(f"Saved: {mask_out}")
+
+    if base_dataset.skipped:
+        print(f"Skipped {len(base_dataset.skipped)} image(s) with no OpenPose detection:")
+        for name in base_dataset.skipped:
+            print(f"  {name}")
+        with open(os.path.join(args.output_dir, "skipped.json"), "w") as f:
+            json.dump(base_dataset.skipped, f, indent=2)
 
 
 if __name__ == "__main__":

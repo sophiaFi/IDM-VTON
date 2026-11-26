@@ -45,7 +45,7 @@ workerPoolSpecs:
                   sys.exit(1)
               for blob in blobs:
                   rel = blob.name[len(prefix):]
-                  if not rel:
+                  if not rel or blob.name.endswith("/"):
                       continue
                   dest = pathlib.Path(local_root) / rel
                   dest.parent.mkdir(parents=True, exist_ok=True)

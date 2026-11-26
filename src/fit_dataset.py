@@ -13,7 +13,7 @@ import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from transformers import CLIPImageProcessor
 
 from src.measurement_encoder import normalize_measurements
@@ -119,6 +119,7 @@ class FITDatasetWithMeasurements(data.Dataset):
         openpose_model=None,
         densepose_fn: Optional[Callable] = None,
         garment_category: str = "upper_body",
+        skip_undetected: bool = False,
     ):
         """
         Args:
@@ -131,6 +132,9 @@ class FITDatasetWithMeasurements(data.Dataset):
                               same resolution as the input (required for inference).
             garment_category: Passed to get_mask_location for agnostic mask
                               generation during inference (default: upper_body).
+            skip_undetected:  Inference only. If OpenPose finds no body, log the
+                              person filename and return None (recorded in
+                              self.skipped) instead of raising.
         """
         super().__init__()
         self.data_root = data_root
@@ -140,6 +144,8 @@ class FITDatasetWithMeasurements(data.Dataset):
         self.openpose_model = openpose_model
         self.densepose_fn = densepose_fn
         self.garment_category = garment_category
+        self.skip_undetected = skip_undetected
+        self.skipped = []
 
         self.transform = transforms.Compose([
             transforms.ToTensor(),
@@ -192,13 +198,13 @@ class FITDatasetWithMeasurements(data.Dataset):
         person_name = record["person"]
 
         # Load images
-        cloth_pil = Image.open(
+        cloth_pil = ImageOps.exif_transpose(Image.open(
             os.path.join(self.data_root, cloth_name)
-        ).convert("RGB").resize((self.width, self.height))
+        )).convert("RGB").resize((self.width, self.height))
 
-        raw_person_pil = Image.open(
+        raw_person_pil = ImageOps.exif_transpose(Image.open(
             os.path.join(self.data_root, person_name)
-        ).convert("RGB")
+        )).convert("RGB")
 
         if self.phase == "inference":
             input_person_pil, person_crop_box = _center_crop_to_aspect(
@@ -243,7 +249,15 @@ class FITDatasetWithMeasurements(data.Dataset):
             # OpenPose and Parsing both expect 384×512
             small = input_person_pil.resize((384, 512))
 
-            keypoints = self.openpose_model(small)
+            try:
+                keypoints = self.openpose_model(small)
+            except IndexError as e:
+                msg = f"OpenPose detected no body in '{person_name}' (dataset index {index})"
+                if not self.skip_undetected:
+                    raise RuntimeError(msg) from e
+                print(f"WARNING: {msg}; skipping", flush=True)
+                self.skipped.append(person_name)
+                return None
             model_parse, _ = self.parsing_model(small)
 
             # Torso column mask derived from parsing: upper_clothes (4) + dress (7).

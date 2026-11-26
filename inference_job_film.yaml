@@ -46,7 +46,7 @@ workerPoolSpecs:
                   sys.exit(1)
               for blob in blobs:
                   rel = blob.name[len(prefix):]
-                  if not rel:
+                  if not rel or blob.name.endswith("/"):
                       continue
                   dest = pathlib.Path(local_root) / rel
                   dest.parent.mkdir(parents=True, exist_ok=True)
@@ -54,7 +54,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/breuni/",     "/tmp/breuni")
+          download_prefix("datasets/own_data/",     "/tmp/own_data")
           download_prefix("models/yisol-IDM-VTON/", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts/",               "/tmp/scripts")
           download_prefix("ckpt/ip_adapter/",       "/tmp/ckpt/ip_adapter")
@@ -65,6 +65,7 @@ workerPoolSpecs:
 
           cp /tmp/scripts/inference_film.py /app/inference_film.py
           cp /tmp/scripts/counterfactual.py /app/src/counterfactual.py
+          cp /tmp/scripts/fit_dataset.py /app/src/fit_dataset.py
 
           # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
           # openpose, and densepose all resolve correctly.
@@ -127,7 +128,7 @@ workerPoolSpecs:
           PYEOF
 
           rm -f /tmp/inference_done
-          python -u /tmp/upload_outputs.py /tmp/film_run_full/inference_output_breuni ma-idm-vton film_run_full/inference_output_breuni 100 &
+          python -u /tmp/upload_outputs.py /tmp/film_run_full/inference_output_val ma-idm-vton film_run_full/inference_output_val 100 &
           UPLOADER_PID=$!
 
           accelerate launch \
@@ -135,8 +136,8 @@ workerPoolSpecs:
             --num_machines=1 \
             inference_film.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/breuni \
-            --output_dir /tmp/film_run_full/inference_output_breuni \
+            --data_dir /tmp/own_data \
+            --output_dir /tmp/film_run_full/inference_output_val \
             --num_samples -1 \
             --start_index "${START_INDEX:-0}" \
             --height 1024 \

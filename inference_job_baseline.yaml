@@ -36,7 +36,7 @@ workerPoolSpecs:
           set -e
 
           BUCKET="ma-idm-vton"
-          OUTPUT_PREFIX="baseline_run/inference_output_breuni"
+          OUTPUT_PREFIX="baseline_run/inference_output_val"
 
           export BUCKET
 
@@ -58,7 +58,7 @@ workerPoolSpecs:
                   sys.exit(1)
               for blob in blobs:
                   rel = blob.name[len(prefix):]
-                  if not rel:
+                  if not rel or blob.name.endswith("/"):
                       continue
                   dest = pathlib.Path(local_root) / rel
                   dest.parent.mkdir(parents=True, exist_ok=True)
@@ -66,7 +66,7 @@ workerPoolSpecs:
                   print(f"  downloaded {blob.name}")
               print(f"Done: {local_root}  ({len(blobs)} files)")
 
-          download_prefix("datasets/breuni/", "/tmp/breuni")
+          download_prefix("datasets/own_data/", "/tmp/own_data")
           download_prefix("models/yisol-IDM-VTON", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts", "/tmp/scripts")
           PYEOF
@@ -74,6 +74,7 @@ workerPoolSpecs:
           cp /tmp/scripts/inference_measurement_adapter.py /app/inference_measurement_adapter.py
           cp /tmp/scripts/utils_mask_original.py /app/gradio_demo/utils_mask_original.py
           cp /tmp/scripts/counterfactual.py /app/src/counterfactual.py
+          cp /tmp/scripts/fit_dataset.py /app/src/fit_dataset.py
 
           # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
           # openpose, and densepose all resolve correctly.
@@ -147,7 +148,7 @@ workerPoolSpecs:
             --num_machines=1 \
             inference_measurement_adapter.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/breuni \
+            --data_dir /tmp/own_data \
             --output_dir /tmp/baseline_inference_output \
             --num_samples -1 \
             --start_index "${START_INDEX:-0}" \

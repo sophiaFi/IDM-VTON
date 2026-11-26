@@ -37,12 +37,12 @@ workerPoolSpecs:
           BUCKET="ma-idm-vton"
           CHECKPOINT_ROOT="adapter_run_anchor_full/checkpoints"
           CHECKPOINT_PREFIX="adapter_run_anchor_full/checkpoints/checkpoint-7500"
-          OUTPUT_PREFIX="adapter_run_anchor_full/inference_output_breuni"
+          OUTPUT_PREFIX="adapter_run_anchor_full/inference_output_val"
           MEASUREMENT_SCALE="1.0"
           # Chunking: process dataset indices [START_INDEX, END_INDEX). END_INDEX=-1 -> to the end.
           # Each chunk uploads to its own subfolder so chunks never overwrite each other.
-          START_INDEX=0
-          END_INDEX=26
+          START_INDEX=26
+          END_INDEX=56
           OUTPUT_PREFIX="$OUTPUT_PREFIX/chunk_${START_INDEX}_${END_INDEX}"
 
           export BUCKET CHECKPOINT_ROOT CHECKPOINT_PREFIX
@@ -65,7 +65,7 @@ workerPoolSpecs:
                   sys.exit(1)
               for blob in blobs:
                   rel = blob.name[len(prefix):]
-                  if not rel:
+                  if not rel or blob.name.endswith("/"):
                       continue
                   dest = pathlib.Path(local_root) / rel
                   dest.parent.mkdir(parents=True, exist_ok=True)
@@ -87,7 +87,7 @@ workerPoolSpecs:
               ckpt_prefix = root + max(dirs, key=lambda d: int(d.split("-")[1]))
           print(f"Using checkpoint gs://{bucket_name}/{ckpt_prefix}")
 
-          download_prefix("datasets/breuni/",     "/tmp/breuni")
+          download_prefix("datasets/own_data/",     "/tmp/own_data")
           download_prefix("models/yisol-IDM-VTON", "/tmp/yisol-IDM-VTON")
           download_prefix("scripts", "/tmp/scripts")
           download_prefix("ckpt/ip_adapter", "/tmp/ckpt/ip_adapter")
@@ -96,6 +96,7 @@ workerPoolSpecs:
 
           cp /tmp/scripts/inference_measurement_adapter.py /app/inference_measurement_adapter.py
           cp /tmp/scripts/counterfactual.py /app/src/counterfactual.py
+          cp /tmp/scripts/fit_dataset.py /app/src/fit_dataset.py
 
           # Wire up /app/ckpt/* so hardcoded relative paths in humanparsing,
           # openpose, and densepose all resolve correctly.
@@ -111,8 +112,8 @@ workerPoolSpecs:
             --num_machines=1 \
             inference_measurement_adapter.py \
             --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-            --data_dir /tmp/breuni \
-            --output_dir /tmp/adapter_inference_output_breuni \
+            --data_dir /tmp/own_data \
+            --output_dir /tmp/adapter_inference_output_val \
             --num_samples -1 \
             --start_index "$START_INDEX" \
             --end_index "$END_INDEX" \
@@ -132,7 +133,7 @@ workerPoolSpecs:
           from google.cloud import storage
           import os, pathlib, sys
 
-          out_dir = pathlib.Path("/tmp/adapter_inference_output_breuni")
+          out_dir = pathlib.Path("/tmp/adapter_inference_output_val")
           if not out_dir.exists():
               print("WARNING: inference output directory not found — inference may have failed.", file=sys.stderr)
               sys.exit(1)

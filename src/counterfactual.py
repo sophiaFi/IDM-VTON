@@ -82,6 +82,8 @@ def iter_batches(dataloader, args):
             json.dump({"sigma": args.cf_sigma, "dims": list(args.cf_dims), "mask": args.cf_mask}, f, indent=2)
 
     for batch in dataloader:
+        if batch is None:
+            continue
         if not (args.counterfactual and args.cf_only):
             yield batch
         if not args.counterfactual:
