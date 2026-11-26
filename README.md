@@ -1,3 +1,4 @@
+The thesis information is in [the thesis README](README_THESIS.md).
 
 <div align="center">
 <h1>IDM-VTON: Improving Diffusion Models for Authentic Virtual Try-on in the Wild</h1>
