@@ -1,16 +1,7 @@
 # Vertex AI CustomJob spec for probe_measurement_sensitivity.py.
 #
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=us-central1 \
-#       --display-name=idm-vton-probe \
-#       --config=probe_job.yaml \
-#
 # The probe result is printed to stdout (visible in Cloud Logging) and also
 # uploaded to gs://ma-idm-vton-data/probe_output/probe_result.txt.
-#
-# Update CHECKPOINT_PREFIX to the GCS prefix of the checkpoint to probe,
-# e.g. checkpoints/checkpoint-200
 
 workerPoolSpecs:
   - machineSpec:

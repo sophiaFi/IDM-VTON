@@ -1,48 +1,6 @@
 """
 evaluate.py — Evaluation pipeline for IDM-VTON (with optional measurement conditioning).
 
-Usage — compare a result folder against ground truth:
-
-    python evaluate.py \\
-        --result_dir result_fit \\
-        --data_dir data/data_mini_test \\
-        --output_dir eval_output
-
-    # With measurement counterfactual analysis. First generate the +/- sigma images with any of the
-    # three inference scripts (inference_fit.py / inference_film.py / inference_measurement_adapter.py):
-    python inference_film.py --data_dir data/data_mini_test --checkpoint_dir output/checkpoint-500 \\
-        --output_dir result_film --num_samples 8 --counterfactual --cf_sigma 2.0
-    # then analyse them (reads result_film/cf/<dimension>/<stem>_{plus,minus}.png):
-    python evaluate.py \\
-        --result_dir result_film \\
-        --data_dir data/data_mini_test \\
-        --cf_dir result_film/cf \\
-        --output_dir eval_output
-
-Computed metrics (following docs/evaluation.md):
-
-  Image quality (vs. ground truth):
-    SSIM, PSNR, LPIPS
-
-  Distribution quality (generated set vs. ground truth set):
-    FID, KID
-
-  Garment region fidelity (inside predicted mask):
-    garment_ssim, garment_lpips
-
-  Garment mask quality (segmented mask vs. GT mask):
-    garment_iou, garment_boundary_f1
-
-  Semantic similarity:
-    clip_sim   — CLIP ViT-B/32 cosine similarity of generated vs. target
-    dino_sim   — DINO ViT-S/8 cosine similarity outside garment region
-
-  Measurement controllability (--cf_dir):
-    For each base measurement, the inference scripts generate ±σ variants with everything else
-    (inputs, seed, steps) fixed; the derived ease features are recomputed consistently. This script
-    segments the garment in each pair and reports the |area| change plus the signed change in area,
-    bbox height and bbox width.
-
 All per-sample results are written to <output_dir>/results.csv.
 A summary JSON is written to <output_dir>/summary.json.
 Side-by-side comparison images are written to <output_dir>/visuals/.
@@ -94,9 +52,6 @@ except Exception:
     pass
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 def load_image_rgb(path: str, size: Optional[tuple] = None) -> Image.Image:
     img = Image.open(path).convert("RGB")
@@ -276,10 +231,6 @@ def boundary_overlap_image(
     return Image.fromarray(base.clip(0, 255).astype(np.uint8))
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Model loaders (lazy, singleton)
-# ──────────────────────────────────────────────────────────────────────────────
-
 _clip_model = None
 _clip_proc = None
 
@@ -328,9 +279,6 @@ def get_lpips(device):
     return _lpips_metric
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Per-metric computations
-# ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def compute_lpips(gen_t: torch.Tensor, gt_t: torch.Tensor, device) -> float:
@@ -392,9 +340,6 @@ def segment_garment_mask(img_pil: Image.Image, device) -> torch.Tensor:
     return garment.clamp(0, 1).unsqueeze(0)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Build file pairs from result_dir and data_dir
-# ──────────────────────────────────────────────────────────────────────────────
 
 def find_pairs(result_dir: str, data_dir: str):
     """
@@ -437,10 +382,6 @@ def load_measurements(data_dir: str) -> dict:
         records = json.load(f)
     return {Path(r["target"]).stem: r for r in records}
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Side-by-side visualisation
-# ──────────────────────────────────────────────────────────────────────────────
 
 def save_visual(
     gen: Image.Image, gt: Image.Image, sample_id: str,
@@ -487,9 +428,6 @@ def save_visual(
     full.save(out_dir / f"{sample_id}.png")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# FID / KID collection pass
-# ──────────────────────────────────────────────────────────────────────────────
 
 def compute_fid_kid(
     gen_tensors: list, gt_tensors: list, device
@@ -532,9 +470,6 @@ def compute_fid_kid(
     return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Garment mask metric chart
-# ──────────────────────────────────────────────────────────────────────────────
 
 def save_mask_metrics_chart(per_sample: list, out_dir: Path):
     """Bar chart of per-sample garment_iou and garment_boundary_f1, saved as mask_metrics.png."""
@@ -566,9 +501,6 @@ def save_mask_metrics_chart(per_sample: list, out_dir: Path):
     print(f"Mask metrics chart → {chart_path}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Counterfactual sensitivity (measurement controllability)
-# ──────────────────────────────────────────────────────────────────────────────
 
 MEASUREMENT_NAMES = [
     "body_bust", "body_height", "body_hips", "body_waist",
@@ -630,9 +562,8 @@ def counterfactual_from_images(cf_dir: str, device: torch.device) -> dict:
     return results
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
+
+
 
 def print_counterfactual(cf: dict):
     print(f"\n── Counterfactual sensitivity (±{cf.get('sigma')}σ) ──────────────────────────────")

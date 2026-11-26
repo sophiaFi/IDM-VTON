@@ -1,9 +1,4 @@
 """Counterfactual measurement sweeps for the inference scripts.
-
-For every sample, each selected measurement is shifted by +/- cf_sigma standard deviations while
-all other inputs, the seed and the number of steps stay fixed. The derived ease features
-(bust_ease, hem_drop) are recomputed so the perturbed input stays consistent. Raw model outputs are
-written to <output_dir>/cf/<dimension>/<stem>_{plus,minus}.png and analysed by evaluate.py --cf_dir.
 """
 
 import json

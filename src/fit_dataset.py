@@ -48,8 +48,6 @@ def _center_crop_to_aspect(pil_image: Image.Image, target_h: int, target_w: int)
     resized = cropped.resize((target_w, target_h), Image.LANCZOS)
     return resized, crop_box
 
-
-# utils_mask lives in gradio_demo/; add it to the path when needed for inference.
 def _import_get_mask_location():
     _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     _gradio_demo = os.path.join(_repo_root, "gradio_demo")
@@ -214,7 +212,6 @@ class FITDatasetWithMeasurements(data.Dataset):
             input_person_pil = raw_person_pil.resize((self.width, self.height))
             person_crop_box = None
 
-        # Initial tensor conversion
         input_person = self.transform(input_person_pil) # [3, H, W], [-1, 1]  (inpainting context)
 
         if self.phase != "inference":
@@ -285,8 +282,6 @@ class FITDatasetWithMeasurements(data.Dataset):
             mask = self.to_tensor(mask_pil)[:1]              # [1, H, W], [0, 1]
             pose = self.to_tensor(densepose_pil)             # [3, H, W], [0, 1]
 
-            # At inference time the target image is not available; use the input
-            # person image so the pipeline has a valid tensor to work with.
             person_image = input_person
             garment_mask = None
 

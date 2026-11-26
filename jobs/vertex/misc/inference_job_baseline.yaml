@@ -1,17 +1,5 @@
 # Vertex AI CustomJob spec: baseline IDM-VTON (pretrained yisol/IDM-VTON, no extension, no measurements)
 # on the same FIT data used for the extensions. Uses inference_measurement_adapter.py without --checkpoint_dir.
-#
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-baseline-inference \
-#       --config=inference_job_baseline.yaml
-#
-# Prerequisites: upload to gs://idm-vton-ma/scripts/
-#   - inference_measurement_adapter.py
-#   - gradio_demo/utils_mask_original.py  (upstream IDM-VTON mask code, from the first repo commit)
-#
-# Results are uploaded to gs://idm-vton-ma/baseline_run/inference_output/.
 
 workerPoolSpecs:
   - machineSpec:

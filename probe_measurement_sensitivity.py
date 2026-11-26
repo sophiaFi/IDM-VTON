@@ -2,21 +2,7 @@
 Measurement sensitivity probe.
 
 After a small training run, load a checkpoint and check whether the
-MeasurementEncoder token actually moves UNet outputs.  Two tests:
-
-  1. Sweep: vary one measurement dimension across [-3σ, +3σ] in 7 steps,
-     record mean absolute UNet-output change relative to the baseline
-     (mean measurements).  Prints a table and flags dead dimensions.
-
-  2. Magnitude: compare the full output difference when all measurements
-     are shifted to +2σ vs -2σ.  If this is near zero the token is ignored.
-
-Usage:
-    python probe_measurement_sensitivity.py \
-        --checkpoint result/checkpoint-200 \
-        --pretrained_model yisol/IDM-VTON \
-        --data_dir gs://ma-idm-vton-data/datasets/fit-mini \
-        --device cuda
+MeasurementEncoder token actually moves UNet outputs.
 
 The script uses a single batch from the test split, runs the UNet at a fixed
 low-noise timestep (t=50), and does not generate full images.

@@ -1,21 +1,5 @@
 """
 inference_measurement_adapter.py - IDM-VTON + Measurement Adapter (Extension 3) inference on FIT data.
-
-Without --checkpoint_dir: pretrained yisol/IDM-VTON, measurements are ignored (baseline).
-
-With --checkpoint_dir <path>: loads the base model, overlays conv_in (unet_lora.pt), builds the
-MeasurementEncoder + MeasurementAdapter from adapter_config.json and installs the third parallel
-cross-attention branch in every TryonNet attn2 layer.
-
-    checkpoint-<step>/
-        unet_lora.pt, measurement_adapter.pt, measurement_encoder.pt, adapter_config.json
-
-Optional --measurement_scale multiplies the (trained) measurement gates at inference time
-(1.0 = as trained, 0.0 = branch off) for sensitivity analyses.
-
-Example:
-    python inference_measurement_adapter.py --data_dir data/data_mini_test \
-        --checkpoint_dir output/checkpoint-500 --output_dir result_adapter --num_samples 4
 """
 
 import argparse
@@ -38,7 +22,6 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
-# Preprocessing models live inside gradio_demo/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "gradio_demo"))
 
 from ip_adapter.ip_adapter import Resampler
@@ -120,9 +103,6 @@ def _compute_garment_composite_mask(
     return mask
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _build_densepose_predictor(device: str, model_path: str):
     import apply_net
@@ -167,9 +147,6 @@ def _pad_to_multiple(t: torch.Tensor, multiple: int = 8):
     return torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IDM-VTON Measurement Adapter inference on FIT dataset.")
@@ -245,9 +222,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -546,8 +520,6 @@ def main():
                 masks_in = masks
                 garment_images_in = garment_images
 
-            # torch 2.0.1 has no bf16 nearest-interpolate kernel; the pipeline's image/mask
-            # processors resize these tensors, so keep them in fp32 (pipeline casts later).
             person_input = person_input.float()
             masks_in = masks_in.float()
 

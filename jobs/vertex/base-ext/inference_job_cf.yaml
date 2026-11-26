@@ -1,24 +1,4 @@
 # Vertex AI CustomJob spec: counterfactual measurement sweep for inference_fit.py (token extension).
-#
-# 30 samples (datasets/counterfactual_test) x 4 measurements x (+2sigma, -2sigma) = 240 generations, 15 steps.
-# Normal generation is skipped (--cf_only); the 1000-sample results are untouched.
-#
-# Prerequisites:
-#   - Upload the CURRENT inference_fit.py, src/counterfactual.py AND src/fit_dataset.py to gs://idm-vton-bucket/scripts/
-#     (as scripts/counterfactual.py and scripts/fit_dataset.py).
-#   - Runs with --cf_mask extended: the inpainting mask is rebuilt from the perturbed measurements
-#     (body_bust/body_height/garment_bust/garment_length), as at inference time. Outputs go to counterfactual_extmask/
-#     so the fixed-mask results in counterfactual/ stay untouched.
-#   - The image's src/measurement_encoder.py must define _MEASURE_MEAN / _MEASURE_STD (current repo version).
-#
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=us-central1 \
-#       --display-name=idm-vton-cf-token \
-#       --config=inference_job_cf.yaml
-#
-# Output: gs://idm-vton-bucket/full_run_1/counterfactual_extmask/cf/<dimension>/<stem>_{plus,minus}.png
-# Analyse with: python evaluate.py --result_dir <results> --data_dir <test> --cf_dir <downloaded>/cf
 
 workerPoolSpecs:
   - machineSpec:

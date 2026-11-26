@@ -52,15 +52,13 @@ def refine_mask(mask):
 
     return refine_mask
 
-# Maximum bust expansion added per side in pixels (at 384×512).
-# Caps runaway expansion caused by noisy keypoints or an atypical bust ratio.
+# Maximum bust expansion added per side in pixels
 MAX_BUST_EXPANSION_PX = 40
 
-# Maximum downward expansion in pixels (at 384×512).
+# Maximum downward expansion in pixels
 MAX_LENGTH_EXPANSION_PX = 100
 
-# Shoulder-to-hip vertical span as a fraction of total body height.
-# Acromion to greater trochanter ≈ 30% of stature (low population variance) with a small buffer
+# Shoulder-to-hip vertical span as a fraction of total body height
 SHOULDER_HIP_TO_HEIGHT_RATIO = 0.28
 
 

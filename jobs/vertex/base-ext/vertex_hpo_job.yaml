@@ -1,18 +1,4 @@
-# Vertex AI CustomJob spec for hyperparameter optimisation.
-#
-# Submit with:
-#   gcloud ai custom-jobs create \
-#       --region=us-central1 \
-#       --display-name=idm-vton-hpo \
-#       --config=vertex_hpo_job.yaml
-#
-# After completion, retrieve results with:
-#   gsutil cp gs://ma-idm-vton-data/hpo/top3_configs.json .
-#   gsutil cp gs://ma-idm-vton-data/hpo/all_trials.csv .
-#
-# The Optuna SQLite study is also persisted after every trial to
-# gs://ma-idm-vton-data/hpo/study.db
-# If the job is preempted, resubmit this YAML and the study will resume from where it left off.
+# Vertex AI CustomJob spec for hyperparameter optimisation (extension 1)
 
 workerPoolSpecs:
   - machineSpec:

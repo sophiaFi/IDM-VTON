@@ -1,25 +1,5 @@
 """
 Hyperparameter optimisation for IDM-VTON + MeasurementEncoder + FiLM extension.
-
-Differences from train_hpo.py (base extension):
-- Custom LoRAConv2d on ResNet convs instead of PEFT LoRA on attention layers.
-- Measurements injected via FiLM modulation (γ/β on ResNet norm2 output),
-  not by appending a token to the cross-attention sequence.
-- FiLMGeneratorSet is a trainable component alongside MeasurementEncoder.
-- lora_alpha_ratio is dropped (PEFT-specific); lora_rank now controls ResNet convs.
-
-Usage (called from vertex_hpo_job_film.yaml):
-  python train_hpo_film.py \
-      --data_dir /tmp/fit-mini \
-      --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-      --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-      --output_dir /tmp/hpo_output \
-      --n_trials 20 \
-      --max_proxy_steps 1000 \
-      --mixed_precision bf16 \
-      --gradient_checkpointing \
-      --gcs_study_bucket idm-vton-bucket \
-      --gcs_study_prefix film_hpo/study.db
 """
 
 import argparse
@@ -53,9 +33,6 @@ from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel
 from src.unet_hacked_tryon import UNet2DConditionModel
 
 
-# ---------------------------------------------------------------------------
-# FiLM infrastructure (mirrors train_with_film.py)
-# ---------------------------------------------------------------------------
 
 class _FiLMContext:
     embedding: Optional[torch.Tensor] = None
@@ -115,9 +92,6 @@ def _register_film_hooks(unet, film_generators: FiLMGeneratorSet, ctx: _FiLMCont
     return hooks
 
 
-# ---------------------------------------------------------------------------
-# Losses (identical to train_hpo.py)
-# ---------------------------------------------------------------------------
 
 _SEGFORMER_GARMENT_IDS = (4, 7)
 _SEG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -184,9 +158,6 @@ def _compute_fit_loss(noise_pred, noisy_latents, timesteps, gt_garment_mask,
     return iou_loss + boundary_weight * _boundary_loss(soft_pred, gt_mask)
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -215,9 +186,6 @@ def parse_args():
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# GCS helpers
-# ---------------------------------------------------------------------------
 
 def _gcs_download(bucket_name, blob_name, local_path):
     try:
@@ -240,9 +208,6 @@ def _gcs_upload(local_path, bucket_name, blob_name):
     gcs.Client().bucket(bucket_name).blob(blob_name).upload_from_filename(local_path)
 
 
-# ---------------------------------------------------------------------------
-# Frozen components (loaded once for all trials)
-# ---------------------------------------------------------------------------
 
 class FrozenComponents:
     def __init__(self, args, device, weight_dtype):
@@ -336,9 +301,6 @@ class FrozenComponents:
         self.weight_dtype = weight_dtype
 
 
-# ---------------------------------------------------------------------------
-# Per-trial UNet construction
-# ---------------------------------------------------------------------------
 
 def _build_trial_unet(frozen: FrozenComponents, lora_rank: int):
     """Reconstruct a LoRA-wrapped TryonNet from the frozen base state dict.
@@ -361,12 +323,6 @@ def _build_trial_unet(frozen: FrozenComponents, lora_rank: int):
     image_proj_model.load_state_dict(frozen.ip_state_dict["image_proj"], strict=True)
     unet.encoder_hid_proj = image_proj_model
 
-    # Gradient checkpointing is intentionally disabled for HPO: FiLM hooks inject a
-    # grad-tracked tensor (meas_emb from trainable measurement_encoder) into multiple
-    # checkpointed segments, which triggers "tensor saved by autograd multiple times"
-    # errors during recomputation. HPO trials are short (<=1000 steps, batch size 1-2)
-    # so the memory saving is not needed.
-
     unet.requires_grad_(False)
     unet.conv_in.requires_grad_(True)
 
@@ -387,9 +343,6 @@ def _build_trial_unet(frozen: FrozenComponents, lora_rank: int):
     return unet.to(frozen.device, dtype=frozen.weight_dtype)
 
 
-# ---------------------------------------------------------------------------
-# Objective
-# ---------------------------------------------------------------------------
 
 def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
 
@@ -591,9 +544,6 @@ def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
     return objective
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _evaluate(unet, measurement_encoder, film_generators, film_ctx: _FiLMContext,
@@ -711,9 +661,7 @@ def _evaluate(unet, measurement_encoder, film_generators, film_ctx: _FiLMContext
     return total_loss / max(n_seen, 1)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()

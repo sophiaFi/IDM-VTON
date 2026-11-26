@@ -1,20 +1,5 @@
 """
 Measurement Adapter for IDM-VTON Extension 3.
-
-Mirrors the garment IP-Adapter for measurements: the measurement embedding is turned into
-a few tokens, and every cross-attention layer of TryonNet gets its own trainable K/V
-projections for them. The resulting attention output is added as a third parallel branch,
-scaled by a trainable gate:
-
-    h = Attn(text) + s_ip * Attn(garment IP tokens) + g(block, t) * Attn(measurement tokens)
-
-The measurement tokens are never appended to the shared context sequence. They travel
-through a side channel (`MeasurementAdapterContext`), and a UNet forward pre-hook matches
-them to the batch size (classifier-free guidance doubles it) and computes the gates from
-the current timestep.
-
-Baseline preservation: to_v of every block is zero-initialised, so the measurement branch
-contributes exactly 0 at step 0 and the pretrained IDM-VTON behaviour is kept.
 """
 
 from typing import List, Optional, Tuple

@@ -1,24 +1,5 @@
 """
 Hyperparameter optimisation for IDM-VTON + MeasurementEncoder + Measurement Adapter (Extension 3).
-
-Differences from train_hpo_film.py:
-- Measurements enter through a parallel, gated cross-attention branch with its own K/V per
-  attn2 layer (src/measurement_adapter.py), not through FiLM / LoRA on ResNet convs.
-- Trainable per trial: MeasurementEncoder and MeasurementAdapter (token projector, per-block
-  K/V, gates). The UNet, including conv_in, is frozen (it runs in bf16, which would stall conv_in
-  updates at small lr). Gates get their own learning-rate multiplier and no weight decay.
-- Min-SNR weighting (--snr_gamma, default 5.0) is applied to the training loss only; the
-  validation metric is the unweighted MSE + fit loss so trials stay comparable.
-- Standard noise schedule (no rescale_betas_zero_snr), as in train_with_measurement_adapter.py.
-
-Usage (called from vertex_hpo_job_adapter.yaml):
-  python train_hpo_measurement_adapter.py \
-      --data_dir /tmp/hpo/train \
-      --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-      --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-      --output_dir /tmp/hpo_output \
-      --n_trials 20 --max_proxy_steps 1000 --mixed_precision bf16 \
-      --gcs_study_bucket idm-vton-bucket --gcs_study_prefix adapter_hpo/study.db
 """
 
 import argparse
@@ -56,9 +37,6 @@ from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel
 from src.unet_hacked_tryon import UNet2DConditionModel
 
 
-# ---------------------------------------------------------------------------
-# Losses (identical to train_hpo_film.py)
-# ---------------------------------------------------------------------------
 
 _SEGFORMER_GARMENT_IDS = (4, 7)
 _SEG_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -125,9 +103,6 @@ def _compute_fit_loss(noise_pred, noisy_latents, timesteps, gt_garment_mask,
     return iou_loss + boundary_weight * _boundary_loss(soft_pred, gt_mask)
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args():
     args = _build_parser().parse_args()
@@ -200,9 +175,6 @@ def _build_parser():
     return p
 
 
-# ---------------------------------------------------------------------------
-# GCS helpers
-# ---------------------------------------------------------------------------
 
 def _gcs_download(bucket_name, blob_name, local_path):
     try:
@@ -225,9 +197,6 @@ def _gcs_upload(local_path, bucket_name, blob_name):
     gcs.Client().bucket(bucket_name).blob(blob_name).upload_from_filename(local_path)
 
 
-# ---------------------------------------------------------------------------
-# Frozen components (loaded once for all trials)
-# ---------------------------------------------------------------------------
 
 class FrozenComponents:
     def __init__(self, args, device, weight_dtype):
@@ -317,21 +286,10 @@ class FrozenComponents:
         self.weight_dtype = weight_dtype
 
 
-# ---------------------------------------------------------------------------
-# Per-trial UNet construction
-# ---------------------------------------------------------------------------
+
 
 def _build_trial_unet(frozen: FrozenComponents):
     """Reconstruct TryonNet from the frozen base state dict (all parameters frozen).
-
-    The Resampler is rebuilt explicitly because UNet2DConditionModel.from_config does not
-    include encoder_hid_proj in its architecture, so load_state_dict(strict=False) would
-    skip those weights. The IP-Adapter attn processors are created by from_config and
-    loaded from the base state dict (processors are part of the UNet state dict).
-
-    Gradient checkpointing is intentionally disabled for HPO (as in train_hpo_film.py):
-    the measurement tokens come from a trainable encoder and are read by every checkpointed
-    attn2 layer. HPO trials are short (<=1000 steps, batch size 1-2), so the memory is not needed.
     """
     unet = UNet2DConditionModel.from_config(frozen.unet_base_config)
     unet.load_state_dict(frozen.unet_base_state_dict, strict=False)
@@ -354,9 +312,7 @@ def _build_trial_unet(frozen: FrozenComponents):
     return unet.to(frozen.device, dtype=frozen.weight_dtype)
 
 
-# ---------------------------------------------------------------------------
-# Batch preparation + loss (shared by training and evaluation)
-# ---------------------------------------------------------------------------
+
 
 def _encode_text(frozen: FrozenComponents, prompts, device):
     ids = frozen.tokenizer(
@@ -471,9 +427,6 @@ def _compute_loss(frozen: FrozenComponents, noise_pred, prep, batch, fit_loss_w,
     return loss
 
 
-# ---------------------------------------------------------------------------
-# Objective
-# ---------------------------------------------------------------------------
 
 def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
     snr_gamma = args.snr_gamma if args.snr_gamma and args.snr_gamma > 0 else None
@@ -639,9 +592,7 @@ def make_objective(frozen: FrozenComponents, train_ds, val_ds, args):
     return objective
 
 
-# ---------------------------------------------------------------------------
-# Evaluation (unweighted MSE + fit loss, measurements without dropout)
-# ---------------------------------------------------------------------------
+
 
 @torch.no_grad()
 def _evaluate(unet, measurement_encoder, adapter, adapter_ctx: MeasurementAdapterContext,
@@ -705,9 +656,7 @@ def _evaluate(unet, measurement_encoder, adapter, adapter_ctx: MeasurementAdapte
     return val_loss, (total_shifted / max(n, 1) if with_shifted else None)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()

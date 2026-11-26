@@ -1,16 +1,3 @@
-# Vertex AI CustomJob spec — passed to --config.
-# The --config flag accepts only the CustomJobSpec fields (workerPoolSpecs,
-# scheduling, …). Top-level job fields like displayName go on the CLI:
-#
-#   gcloud ai custom-jobs create \
-#       --region=<REGION> \
-#       --display-name=idm-vton-profile-run \
-#       --config=vertex_job_top3_2.yaml
-#
-# After the job finishes, retrieve the profile with:
-#   gsutil cp gs://ma-idm-vton/profile_output/resource_profile.json .
-# Or read it directly from Cloud Logging (it is also printed to stdout).
-
 workerPoolSpecs:
   - machineSpec:
       machineType: a2-highgpu-1g

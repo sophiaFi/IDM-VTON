@@ -1,29 +1,8 @@
 """
 Training script for IDM-VTON + Measurement Adapter (Extension 3) on the FIT dataset.
 
-Measurement Adapter (IP-Adapter principle applied to measurements):
-- MeasurementEncoder (MLP, optional Fourier features) -> embedding [B, D]
-- MeasurementAdapter: embedding -> K tokens (default 4) + per-block trainable K/V projections
-- In every TryonNet cross-attention layer (attn2, 70 in SDXL) the output becomes
-      Attn(text) + s_ip * Attn(garment IP tokens) + g(block, t) * Attn(measurement tokens)
-  The measurement tokens are NOT appended to the context sequence (unlike Ext 1).
-- g is trainable: --scale_mode global | block | timestep (see src/measurement_adapter.py).
-- to_v of the adapter is zero-initialised, so training starts exactly at the pretrained baseline.
-
 Trainable: MeasurementEncoder, MeasurementAdapter (token projector, K/V, gates), conv_in.
 Frozen:    VAE, text/image encoders, GarmentNet, garment IP-Adapter + Resampler, rest of TryonNet.
-
-The measurement tokens travel through a side channel (MeasurementAdapterContext). ctx.tokens must
-stay set until after accelerator.backward() because gradient checkpointing recomputes the forward.
-
-Checkpoint layout per saved epoch:
-  checkpoint-<step>/
-    unet_lora.pt             <- trainable UNet params (conv_in)
-    measurement_adapter.pt   <- MeasurementAdapter state dict
-    measurement_encoder.pt   <- MeasurementEncoder state dict (includes the Fourier projection buffer)
-    adapter_config.json      <- hyper-parameters needed to rebuild the modules at inference
-    optimizer.pt
-    lr_scheduler.pt
 """
 
 import os
@@ -209,8 +188,6 @@ def main():
             )
 
     # ── Load models ───────────────────────────────────────────────────────────
-    # Standard schedule (no rescale_betas_zero_snr): the pretrained model was trained with it and
-    # min-SNR weighting is well defined for every timestep (see fix in commit 0a1da13).
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer   = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2")
@@ -312,7 +289,6 @@ def main():
         weight_dtype = torch.bfloat16
 
     vae.to(accelerator.device)
-    # Text encoders stay on CPU and visit the GPU only for the encoding window of each step.
     text_encoder.to(dtype=weight_dtype)
     text_encoder_2.to(dtype=weight_dtype)
     image_encoder.to(accelerator.device,  dtype=weight_dtype)
@@ -482,7 +458,6 @@ def main():
         if os.path.exists(sched_path):
             lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
 
-    # ── Validation metrics (mirror evaluate.py: SegFormer ids {4,5,7}, torchmetrics VGG LPIPS) ──
     _val_lpips = {}
 
     @torch.no_grad()
@@ -771,13 +746,12 @@ def main():
                 text_embeds        = enc1.hidden_states[-2]   # [B, 77, 768]
                 pooled_text_embeds = enc2[0]                  # [B, 1280]
                 text_embeds_2      = enc2.hidden_states[-2]   # [B, 77, 1280]
-                # Context stays [B, 77, 2048]: measurements are NOT appended (own attention branch).
+                # Context stays [B, 77, 2048]: measurements are not appended (own attention branch).
                 encoder_hidden_states = torch.cat([text_embeds, text_embeds_2], dim=-1)
 
                 # ── Measurement tokens -> adapter context ────────────────────
                 measurements = batch["measurements"].to(accelerator.device, dtype=torch.float32)
                 adapter_ctx.tokens = _embed_to_tokens(measurements, args.measurement_dropout)
-                # NOT cleared before backward: gradient checkpointing recomputes the forward.
 
                 # ── SDXL time/size conditioning ───────────────────────────────
                 def compute_time_ids(original_size, crops_coords_top_left=(0, 0)):
@@ -822,9 +796,6 @@ def main():
                 reference_features = list(reference_features)
 
                 # ── Anchor target: same forward with the measurement branch off (no grad) ──
-                # conv_in is shared, so this isolates the effect of the measurement branch only.
-                # The pre-hook recomputes active_tokens/gates on every forward, so restoring
-                # ctx.tokens afterwards is enough for the main (checkpointed) forward.
                 noise_pred_off = None
                 if args.anchor_weight > 0:
                     meas_tokens = adapter_ctx.tokens

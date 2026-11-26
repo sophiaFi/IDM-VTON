@@ -1,25 +1,12 @@
 """
 Preprocessing script for the FIT dataset.
 
-Steps (all idempotent — already-computed outputs are skipped):
+Steps:
   1. Agnostic masks   → {data_root}/agnostic-mask/
   2. DensePose maps   → {data_root}/image-densepose/
   3. GT garment masks → {data_root}/garment-mask/
-     Binary silhouette of the worn garment on the target/ image, extracted by
-     running the ATR humanparsing model on the *target* image (person already
-     wearing the garment) and keeping labels 4 (upper-clothes) + 14/15 (arms),
-     with hole-filling.  Used as ground truth for the fit loss in training.
   4. Garment captions (BLIP-2) → written back into measurements.json as
      "garment_caption" on each record.
-
-Run from the repo root:
-    python preprocess_fit.py --data_root data/data_mini_test [--captions-only] [--expand-mask] [--device cuda]
-
-Upload results to Google Cloud (e.g. agnostic masks, densepose, garment masks):
-gsutil -m rsync -r data/data_mini_test/agnostic-mask/ gs://ma-idm-vton-data/datasets/fit-mini/agnostic-mask/
-gsutil -m rsync -r data/data_mini_test/image-densepose/ gs://ma-idm-vton-data/datasets/fit-mini/image-densepose/
-gsutil -m rsync -r data/data_mini_test/garment-mask/ gs://ma-idm-vton-data/datasets/fit-mini/garment-mask/
-
 """
 
 import argparse
@@ -44,10 +31,6 @@ from preprocess.humanparsing.run_parsing import Parsing
 from preprocess.openpose.run_openpose import OpenPose
 from utils_mask import get_mask_location
 
-
-# ---------------------------------------------------------------------------
-# DensePose helper — build predictor once and reuse across images
-# ---------------------------------------------------------------------------
 
 def _build_densepose_predictor(device: str):
     args = apply_net.create_argument_parser().parse_args([
@@ -177,9 +160,6 @@ def _parsing_to_garment_mask(model_parse: Image.Image) -> Image.Image:
     return Image.fromarray(refined, mode="L")
 
 
-# ---------------------------------------------------------------------------
-# Main preprocessing loop
-# ---------------------------------------------------------------------------
 
 def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_mask: bool = False):
     measurements_path = os.path.join(data_root, "measurements.json")
@@ -214,7 +194,7 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
         if already_done:
             continue
 
-        # Use the input person image (wearing a different garment) — not the target —
+        # Use the input person image (wearing a different garment)
         # so the agnostic mask and densepose match what is available at inference time.
         person_pil = Image.open(os.path.join(data_root, record["person"])).convert("RGB")
 
@@ -271,10 +251,6 @@ def preprocess(data_root: str, category: str, device: str, gpu_id: int, expand_m
     else:
         print("\nAll images processed successfully.")
 
-
-# ---------------------------------------------------------------------------
-# BLIP-2 garment captioning
-# ---------------------------------------------------------------------------
 
 # Prompt that steers BLIP-2 away from describing the background / mannequin
 # and towards the garment itself.
@@ -390,7 +366,7 @@ def generate_captions(data_root: str, device: str, batch_size: int = 8):
     print(f"\nCaptions written to {measurements_path}")
 
 
-# ---------------------------------------------------------------------------
+
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess FIT dataset images.")

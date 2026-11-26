@@ -13,9 +13,6 @@ A five-panel row is saved per sample:
   5 — length debug: torso borders, garment lines, shoulder/hip rows, centre measure line
 
 A row info banner above each row shows id, bust_ratio, length_ratio, px_per_cm.
-
-Usage:
-    python test_expand_mask_new.py [--data_root data/data_mini_test] [--n 4] [--device cuda]
 """
 
 import argparse
@@ -41,10 +38,6 @@ from preprocess_fit import (
 from utils_mask import get_mask_location, get_bust_measurement_lines, get_length_measurement_lines
 
 
-# ---------------------------------------------------------------------------
-# Layout constants
-# ---------------------------------------------------------------------------
-
 PANEL_W    = 384
 PANEL_H    = 512
 LABEL_H    = 24
@@ -54,9 +47,6 @@ BG         = (30, 30, 30)
 TEXT_COLOR = (220, 220, 220)
 
 
-# ---------------------------------------------------------------------------
-# Color palette
-# ---------------------------------------------------------------------------
 
 C_MASK_TINT    = (220,  60,  60)   # red tint  — mask region overlay
 C_SHOULDER_HIP = (130, 200, 255)   # lt blue   — shoulder-hip connections + points
@@ -71,9 +61,6 @@ C_HIP_ROW      = (255, 234,   0)   # yellow    — hip row (dashed)
 C_SH_CENTRE    = (255, 153,   0)   # lt orange — shoulder-to-hip centre measure line (dashed)
 
 
-# ---------------------------------------------------------------------------
-# Font helper
-# ---------------------------------------------------------------------------
 
 def _font(size: int = 12) -> ImageFont.ImageFont:
     try:
@@ -81,10 +68,6 @@ def _font(size: int = 12) -> ImageFont.ImageFont:
     except OSError:
         return ImageFont.load_default()
 
-
-# ---------------------------------------------------------------------------
-# Drawing helpers
-# ---------------------------------------------------------------------------
 
 def _draw_line_with_dots(draw, p0, p1, color, r: int = 4, width: int = 2):
     draw.line([p0, p1], fill=color, width=width)
@@ -123,9 +106,6 @@ def _draw_vline(draw, x, y0, y1, color, width: int = 2):
     draw.line([(int(x), int(y0)), (int(x), int(y1))], fill=color, width=width)
 
 
-# ---------------------------------------------------------------------------
-# Label / banner builders
-# ---------------------------------------------------------------------------
 
 def _label(text: str) -> Image.Image:
     img = Image.new("RGB", (PANEL_W, LABEL_H), BG)
@@ -141,9 +121,6 @@ def _row_info_banner(text: str, width: int) -> Image.Image:
     return img
 
 
-# ---------------------------------------------------------------------------
-# Panel builders
-# ---------------------------------------------------------------------------
 
 def _mask_panel(mask: Image.Image, person: Image.Image | None, title: str) -> Image.Image:
     """Panels 1-3 and 6: red-tint mask overlay on person, no annotation lines."""
@@ -359,9 +336,6 @@ def _length_debug_panel(
     return out
 
 
-# ---------------------------------------------------------------------------
-# Legend
-# ---------------------------------------------------------------------------
 
 LEGEND_ITEM_H = 18
 LEGEND_PAD    = 10

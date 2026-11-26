@@ -1,26 +1,5 @@
 """
 Training script for IDM-VTON + Measurement Encoder on the FIT dataset.
-
-Extends train_xl.py by:
-- Using FITDatasetWithMeasurements (src/fit_dataset.py) as the training dataset.
-- Instantiating MeasurementEncoder (src/measurement_encoder.py) with output_dim=2048
-  to match SDXL's cross-attention dim (CLIP-L 768 + OpenCLIP 1280).
-- Concatenating the measurement token to the text cross-attention sequence before
-  every UNet forward pass: encoder_hidden_states [B, 77, 2048] -> [B, 78, 2048].
-
-Parameter-efficient fine-tuning strategy:
-- LoRA (rank 4 by default) on all attention Q/K/V/out projections in TryonNet.
-  to_k_ip / to_v_ip (IP-Adapter) are NOT targeted — they keep their pretrained weights.
-- The expanded conv_in (9→13 channels, new densepose channels zero-initialized) is
-  trained in full so the model can learn to use densepose from scratch.
-- MeasurementEncoder is trained in full (new module, no pretrained weights).
-- Everything else (VAE, text encoders, image encoder, GarmentNet, Resampler) is frozen.
-
-Checkpoint layout per saved epoch:
-  checkpoint-<step>/
-    lora/                   ← LoRA adapter weights (peft format)
-    conv_in.pt              ← trained conv_in state dict
-    measurement_encoder.pt  ← MeasurementEncoder state dict
 """
 
 import copy
@@ -156,8 +135,6 @@ def parse_args():
                         help="GCS path (gs://bucket/prefix/checkpoint-N) or local path to resume from.")
     # Misc
     parser.add_argument("--local_rank", type=int, default=-1)
-    # Resource profiling: run for N steps then write resource_profile.json and exit.
-    # Set to 0 (default) to disable and run a full training.
     parser.add_argument("--profile_steps", type=int, default=0,
                         help="If > 0, run this many steps, save a resource profile, and exit.")
     parser.add_argument("--memory_log_steps", type=int, default=10,
@@ -253,13 +230,6 @@ def _compute_fit_loss(
 ) -> torch.Tensor:
     """Fit loss: soft IoU + boundary loss between predicted and GT garment silhouette.
 
-    Steps:
-      1. Reconstruct the denoised latent x0_pred from the UNet output.
-      2. Decode x0_pred through the (frozen) VAE to pixel space.
-      3. Run the frozen SegFormer to get soft per-pixel garment logits on the decoded image.
-      4. Compare the soft generated garment mask against the GT mask (from garment-mask/)
-         using soft IoU loss and a morphological boundary loss.
-
     Only applied at low-noise timesteps (alpha_t > alpha_threshold) where x0_pred is
     reliable.  Returns 0 if all timesteps in the batch are above the noise threshold
     (i.e. too noisy to get a usable decode).
@@ -305,8 +275,6 @@ def _compute_fit_loss(
         x0_pred = noise_pred
 
     # ── 2. Decode to pixel space ──────────────────────────────────────────────
-    # VAE decode: latent → [-1, 1] pixel image  [B, 3, H, W]
-    # Cast to VAE dtype (may be fp16) then back to float32 for subsequent ops.
     decoded = vae.decode(
         (x0_pred / vae.config.scaling_factor).to(dtype=vae.dtype)
     ).sample.float()  # [B, 3, H, W], [-1, 1]
@@ -339,7 +307,6 @@ def _compute_fit_loss(
     union = (soft_pred + gt_mask - soft_pred * gt_mask).sum(dim=(1, 2, 3)).clamp(min=1e-8)
     iou_loss = (1.0 - intersection / union).mean()
 
-    # Boundary loss
     b_loss = _boundary_loss(soft_pred, gt_mask)
 
     return iou_loss + boundary_weight * b_loss
@@ -360,8 +327,6 @@ def main():
 
     logger = _setup_cloud_logging() if accelerator.is_main_process else None
 
-    # Sliding window of the last 20 allocated-memory readings; used to detect
-    # a monotonic upward trend that would indicate a GPU memory leak.
     _alloc_history: deque = deque(maxlen=20)
 
     def _log_mem(tag: str, step: int) -> None:
@@ -378,7 +343,6 @@ def main():
 
         alloc = snap["gpu_alloc_gb"]
         _alloc_history.append(alloc)
-        # Warn if every reading in the window is strictly larger than the one before it.
         if len(_alloc_history) == _alloc_history.maxlen and all(
             _alloc_history[i] < _alloc_history[i + 1] for i in range(len(_alloc_history) - 1)
         ):
@@ -413,7 +377,7 @@ def main():
     unet.config["encoder_hid_dim"] = image_encoder.config.hidden_size
     unet.config["encoder_hid_dim_type"] = "ip_image_proj"
 
-    # ── IP-Adapter weights → attention processors ─────────────────────────────
+    # ── IP-Adapter weights ─────────────────────────────
     if args.pretrained_ip_adapter_path:
         ip_bin = args.pretrained_ip_adapter_path
     else:
@@ -422,8 +386,6 @@ def main():
     adapter_modules = torch.nn.ModuleList(unet.attn_processors.values())
     adapter_modules.load_state_dict(state_dict["ip_adapter"], strict=True)
 
-    # Resampler: projects CLIP image features → IP tokens [B, num_tokens, cross_attn_dim]
-    # Frozen — the garment appearance path is already well-trained in IDM-VTON.
     image_proj_model = Resampler(
         dim=image_encoder.config.hidden_size,
         depth=4,
@@ -438,9 +400,6 @@ def main():
     unet.encoder_hid_proj = image_proj_model
 
     # ── Expand TryonNet input conv 9 → 13 channels if needed ─────────────────
-    # yisol/IDM-VTON already has 13 input channels (noisy latent 4 | mask 1 |
-    # masked-image latent 4 | densepose latent 4), so skip expansion in that case.
-    # Only expand when starting from a raw 9-channel SDXL inpainting base.
     if unet.conv_in.in_channels == 9:
         conv_new = torch.nn.Conv2d(
             in_channels=13, out_channels=unet.conv_in.out_channels, kernel_size=3, padding=1
@@ -484,8 +443,6 @@ def main():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-        # unet_encoder is frozen — gradient checkpointing on it adds recomputation overhead
-        # with no memory benefit since no backward flows through it.
 
     # ── Freeze everything, then apply LoRA selectively ───────────────────────
     vae.requires_grad_(False)
@@ -497,7 +454,6 @@ def main():
     unet.requires_grad_(False)
 
     # LoRA on all attention Q/K/V/out projections (both self- and cross-attention).
-    # "to_k" / "to_v" do NOT match "to_k_ip" / "to_v_ip" (suffix mismatch), so
     # the IP-Adapter key/value projections remain frozen.
     lora_config = LoraConfig(
         r=args.lora_rank,
@@ -508,8 +464,6 @@ def main():
     )
     unet = get_peft_model(unet, lora_config)
 
-    # conv_in must be trainable separately: LoRA does not cover Conv2d layers and
-    # the 4 new densepose channels need to be learned from zero.
     unet.base_model.model.conv_in.requires_grad_(True)
 
     measurement_encoder.requires_grad_(True)
@@ -520,9 +474,6 @@ def main():
         segmenter = SegformerForSemanticSegmentation.from_pretrained(args.segmenter_model)
         segmenter.requires_grad_(False)
         segmenter.eval()
-        # Keep segmenter in float32: bf16 lacks a CUDA bilinear-upsample kernel in
-        # PyTorch 2.0.x, which crashes inside SegFormer's decode head. The segmenter
-        # is frozen so the dtype doesn't affect training numerics.
         segmenter.to(accelerator.device, dtype=torch.float32)
 
     # ── Optimizer (LoRA params + conv_in + MeasurementEncoder) ───────────────
@@ -552,9 +503,6 @@ def main():
         _log_mem("after-model-load", 0)
 
     # ── Datasets ──────────────────────────────────────────────────────────────
-    # Both train and validation splits are drawn from data_dir/train/ so that
-    # data_dir/test/ stays completely held out for final evaluation.
-    # Hyperparameters and checkpoints are selected on the val split only.
     full_train_dataset = FITDatasetWithMeasurements(
         data_root=args.data_dir, phase="train", size=(args.height, args.width)
     )
@@ -622,7 +570,6 @@ def main():
 
         # Download from GCS if a gs:// URI is given
         if resume_path.startswith("gs://"):
-            # gs://bucket/prefix/checkpoint-N  →  bucket, prefix/checkpoint-N
             without_scheme = resume_path[len("gs://"):]
             bucket_name, gcs_prefix = without_scheme.split("/", 1)
             local_resume = os.path.join(args.output_dir, "resumed_checkpoint")
@@ -676,9 +623,6 @@ def main():
         if not accelerator.is_main_process:
             return
         menc_unwrapped = accelerator.unwrap_model(measurement_encoder)
-        # Move the training UNet to CPU before copying so the deepcopy happens in
-        # CPU RAM instead of GPU memory.  Without this, two full UNet copies exist
-        # on GPU simultaneously, exhausting VRAM on a 40 GB A100.
         unet_unwrapped = accelerator.unwrap_model(unet)
         unet_unwrapped.to("cpu")
         merged_unet = copy.deepcopy(unet_unwrapped).merge_and_unload()
@@ -704,13 +648,9 @@ def main():
             ).to(accelerator.device)
 
             for sample in test_dataloader:
-                # Compute measurement tokens for this batch so validation images reflect
-                # measurement conditioning (matching the training forward pass).
                 meas = sample["measurements"].to(accelerator.device, dtype=torch.float32)
                 menc_tokens = menc_unwrapped(meas, measurement_dropout_prob=0.0)  # [B, 1, 2048]
 
-                # Patch the pipeline UNet forward to inject the measurement token.
-                # During CFG the UNet receives a 2B batch ([uncond; cond]), so repeat to match.
                 _orig_unet_fwd = newpipe.unet.forward
                 def _fwd_with_measurements(
                     sample_t, timestep, encoder_hidden_states, *args,
@@ -725,9 +665,6 @@ def main():
                     return _orig_unet_fwd(sample_t, timestep, enc, *args, **kwargs)
                 newpipe.unet.forward = _fwd_with_measurements
 
-                # Pass CLIP-preprocessed pixels to ip_adapter_image. The pipeline
-                # encodes them internally through image_encoder + Resampler, which is
-                # equivalent to the training forward pass.
                 img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
                 num_prompts = len(img_emb_list)
                 image_embeds = torch.cat(img_emb_list, dim=0).to(accelerator.device)  # [B, 3, 224, 224]

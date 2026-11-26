@@ -1,13 +1,4 @@
-# Vertex AI CustomJob spec — IDM-VTON FiLM Extension
-#
-# Submit with:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-film-run-1 \
-#       --config=vertex_job_film.yaml
-#
-# On SPOT preemption the job restarts automatically (disableRetries: false).
-# The startup script detects the latest checkpoint in GCS and resumes from it.
+# Vertex AI CustomJob spec - IDM-VTON FiLM Extension
 
 workerPoolSpecs:
   - machineSpec:

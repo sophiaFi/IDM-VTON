@@ -1,13 +1,4 @@
 # Vertex AI CustomJob spec — IDM-VTON Measurement Adapter Extension (Ext 3)
-#
-# Submit with:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-adapter-run-1 \
-#       --config=vertex_job_adapter.yaml
-#
-# On SPOT preemption the job restarts automatically (disableRetries: false).
-# The startup script detects the latest checkpoint in GCS and resumes from it.
 
 workerPoolSpecs:
   - machineSpec:

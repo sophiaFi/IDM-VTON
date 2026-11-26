@@ -1,13 +1,4 @@
-# Vertex AI CustomJob spec
-#
-# Submit with:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-full-run-1 \
-#       --config=vertex_job.yaml
-#
-# On SPOT preemption the job restarts automatically (disableRetries: false).
-# The startup script detects the latest checkpoint in GCS and resumes from it.
+# Vertex AI CustomJob spec (extension 1)
 
 workerPoolSpecs:
   - machineSpec:

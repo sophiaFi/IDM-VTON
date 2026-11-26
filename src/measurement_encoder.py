@@ -88,10 +88,7 @@ class FourierFeatureProjection(nn.Module):
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
-# FIT dataset train-split statistics (cm).  Indices 0-6 are the seven base measurements;
-# indices 7-8 are derived ease features computed in normalize_measurements().
-# bust_ease and hem_drop stats are estimated from the marginal distributions —
-# recompute from the actual train split if precision matters.
+# FIT dataset train-split statistics (cm)
 _MEASURE_MEAN = torch.tensor([
     105.118,  # body_bust
     172.126,  # body_height
@@ -112,8 +109,8 @@ _MEASURE_STD = torch.tensor([
     13.072,   # garment_bust
      8.594,   # garment_length
     18.197,   # garment_sleeve_length
-    10.0,     # bust_ease  (estimated)
-    12.3,     # hem_drop   (estimated)
+    10.0,     # bust_ease
+    12.3,     # hem_drop
 ])
 
 

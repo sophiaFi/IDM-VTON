@@ -1,18 +1,4 @@
 # Vertex AI CustomJob spec for FiLM hyperparameter optimisation.
-#
-# Submit with:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-film-hpo \
-#       --config=vertex_hpo_job_film.yaml
-#
-# After completion, retrieve results with:
-#   gsutil cp gs://idm-vton-bucket/film_hpo/top3_configs.json .
-#   gsutil cp gs://idm-vton-bucket/film_hpo/all_trials.csv .
-#
-# The Optuna SQLite study is persisted after every trial to
-# gs://idm-vton-bucket/film_hpo/study.db
-# If the job is preempted, resubmit this YAML and the study resumes automatically.
 
 workerPoolSpecs:
   - machineSpec:

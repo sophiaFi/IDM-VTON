@@ -1,35 +1,5 @@
 """
 inference_fit.py — Run IDM-VTON inference on FIT dataset samples.
-
-Two modes:
-
-  Without --checkpoint_dir (default):
-    Loads yisol/IDM-VTON pretrained weights and runs inference on FIT data.
-    Measurements are read but not injected (the pretrained model has no
-    measurement conditioning). Use this to verify the data pipeline and get a
-    baseline before any fine-tuning.
-
-  With --checkpoint_dir <path>:
-    Loads the base model specified by --pretrained_model_name_or_path (must be
-    the SAME base used during training, default yisol/IDM-VTON), then overlays
-    LoRA + conv_in + MeasurementEncoder weights from the checkpoint. Measurement
-    tokens are appended to the cross-attention sequence
-    ([B, 77, 2048] → [B, 78, 2048]) for positive prompt; zero token for negative/CFG.
-
-    IMPORTANT: --pretrained_model_name_or_path must match the training base model.
-    Training uses yisol/IDM-VTON (13-channel UNet). Using a different base
-    (e.g. diffusers/stable-diffusion-xl-1.0-inpainting-0.1) will corrupt outputs
-    because LoRA deltas are additive offsets on top of the training base weights.
-
-Example (quick single-sample test, no checkpoint):
-    python inference_fit.py --data_dir data/data_mini_test --num_samples 1
-
-Example (after training):
-    python inference_fit.py \
-        --data_dir data/data_mini_test \
-        --checkpoint_dir output/checkpoint-500 \
-        --output_dir result_fit \
-        --num_samples 4
 """
 
 import argparse
@@ -53,7 +23,6 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
-# Preprocessing models live inside gradio_demo/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "gradio_demo"))
 
 from ip_adapter.ip_adapter import Resampler
@@ -241,9 +210,6 @@ def main():
         weight_dtype = torch.bfloat16
 
     if not use_checkpoint:
-        # Pretrained IDM-VTON: all submodels (including image_encoder and
-        # unet_encoder) live inside yisol/IDM-VTON. Load them explicitly so the
-        # pipeline doesn't try to resolve them from config files that don't exist.
         unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet",
             torch_dtype=weight_dtype,
@@ -276,8 +242,6 @@ def main():
         # ── Checkpoint mode ───────────────────────────────────────────────────
         from peft import PeftModel
 
-        # GarmentNet: yisol/IDM-VTON stores it under unet_encoder/; a custom path
-        # uses the unet/ subfolder of that path.
         garmentnet_path = args.pretrained_garmentnet_path or args.pretrained_model_name_or_path
         garmentnet_subfolder = "unet" if args.pretrained_garmentnet_path else "unet_encoder"
 
@@ -298,8 +262,6 @@ def main():
             torch_dtype=weight_dtype,
         ).to(device)
 
-        # Image encoder: yisol/IDM-VTON has it under image_encoder/; fall back to
-        # the external ckpt path when supplied.
         if args.image_encoder_path:
             image_encoder = CLIPVisionModelWithProjection.from_pretrained(
                 args.image_encoder_path,
@@ -320,7 +282,6 @@ def main():
             args.pretrained_model_name_or_path, subfolder="unet",
             low_cpu_mem_usage=False, device_map=None,
         )
-        # IP-Adapter weights: yisol/IDM-VTON bundles them; fall back to external path.
         ip_bin = args.ip_adapter_path or os.path.join(
             args.pretrained_model_name_or_path, "ip_adapter", "ip-adapter-plus_sdxl_vit-h.bin"
         )

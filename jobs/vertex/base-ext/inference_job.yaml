@@ -1,15 +1,4 @@
-# Vertex AI CustomJob spec for inference_fit.py.
-#
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=us-central1 \
-#       --display-name=idm-vton-inference \
-#       --config=inference_job.yaml
-#
-# Results are uploaded to gs://ma-idm-vton-data/inference_output/.
-#
-# To run with a fine-tuned checkpoint, set CHECKPOINT_PREFIX below and
-# uncomment the checkpoint download + --checkpoint_dir flag.
+# Vertex AI CustomJob spec for inference_fit.py (extension 1)
 
 workerPoolSpecs:
   - machineSpec:

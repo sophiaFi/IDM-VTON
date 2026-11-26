@@ -1,9 +1,6 @@
 """
 Compute mean and std for all 7 measurements over the full FIT train split.
 Uses Welford's online algorithm so the full dataset never loads into memory.
-
-Run with:
-    python data/compute_measurement_stats.py --data-path "../../fit_data/train-*.parquet"
 """
 import argparse
 import math
@@ -50,7 +47,6 @@ for k in MEASUREMENT_KEYS:
     std = math.sqrt(M2[k] / n) if n > 1 else 0.0
     print(f"{k:<30} {n:>8} {mean[k]:>10.3f} {std:>10.3f}")
 
-print("\nConstants for pasting into measurement_encoder.py:")
 print("MEAN = torch.tensor([")
 for k in MEASUREMENT_KEYS:
     print(f"    {mean[k]:.3f},  # {k}")

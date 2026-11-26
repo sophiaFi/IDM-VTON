@@ -1,19 +1,7 @@
 """
 Uniformly samples a given number of datapoints from the FIT dataset.
-
-Row indices are drawn at random over the whole split and only the row groups
-containing them are read, so no shuffle buffer is needed. Each sample is
-written to disk as soon as it is read. Rows whose images cannot be decoded are
-logged and replaced by another randomly drawn row.
-
-Run with:
-    python sample_data.py \
-        --data-path "../../dataset/data" \
-        --split "train" \
-        --num-samples 10000 \
-        --resize \
-        --output-name "data/full"
 """
+
 import io
 import json
 import argparse

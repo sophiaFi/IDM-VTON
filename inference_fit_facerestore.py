@@ -1,47 +1,5 @@
 """
 inference_fit_facerestore.py — IDM-VTON inference with face+hair restoration.
-
-Compositing strategy: use the full generated image as the base (so the garment
-looks exactly as generated with no seams at the garment boundary), then paste
-back only the face and hair regions from the input person image.
-
-This avoids the core problem of all garment-boundary compositing approaches
-(seams at cuffs, arm position mismatches, agnostic mask overreach) by moving
-the compositing boundary far away from the garment — into the hair edges and
-forehead — where a small feather blends naturally.
-
-The face+hair mask is produced by the ATR humanparsing model that is already
-loaded for preprocessing (labels 2=hair, 11=face), so no new models are needed.
-
-Two modes:
-
-  Without --checkpoint_dir (default):
-    Loads yisol/IDM-VTON pretrained weights and runs inference on FIT data.
-    Measurements are read but not injected (the pretrained model has no
-    measurement conditioning). Use this to verify the data pipeline and get a
-    baseline before any fine-tuning.
-
-  With --checkpoint_dir <path>:
-    Loads the base model specified by --pretrained_model_name_or_path (must be
-    the SAME base used during training, default yisol/IDM-VTON), then overlays
-    LoRA + conv_in + MeasurementEncoder weights from the checkpoint. Measurement
-    tokens are appended to the cross-attention sequence
-    ([B, 77, 2048] → [B, 78, 2048]) for positive prompt; zero token for negative/CFG.
-
-    IMPORTANT: --pretrained_model_name_or_path must match the training base model.
-    Training uses yisol/IDM-VTON (13-channel UNet). Using a different base
-    (e.g. diffusers/stable-diffusion-xl-1.0-inpainting-0.1) will corrupt outputs
-    because LoRA deltas are additive offsets on top of the training base weights.
-
-Example (quick single-sample test, no checkpoint):
-    python inference_fit_facerestore.py --data_dir data/data_mini_test --num_samples 1
-
-Example (after training):
-    python inference_fit_facerestore.py \\
-        --data_dir data/data_mini_test \\
-        --checkpoint_dir output/checkpoint-500 \\
-        --output_dir result_fit_facerestore \\
-        --num_samples 4
 """
 
 import argparse

@@ -1,41 +1,5 @@
 """
 Training script for IDM-VTON + MeasurementEncoder + FiLM Extension on the FIT dataset.
-
-FiLM (Feature-wise Linear Modulation) extension:
-- Measurements condition TryonNet DIRECTLY via element-wise feature modulation,
-  bypassing the attention mechanism used in the base (token-concatenation) extension.
-- FiLM(h | m) = γ(m) ⊙ h + β(m), injected after norm2 and before the SiLU nonlinearity
-  in the target ResNet blocks.
-- Target blocks (lowest spatial resolution): down_blocks[-1] (DownBlock2D, deepest),
-  mid_block (UNetMidBlock2DCrossAttn), up_blocks[0] (UpBlock2D, first decoder block).
-- FiLM Generator Heads are initialized with γ ≈ 1, β ≈ 0 so training begins near
-  the pretrained baseline and measurement influence grows gradually.
-
-Parameter-efficient fine-tuning strategy (LoRA on ResNet convs):
-- MeasurementEncoder: trained in full.
-- FiLMGeneratorSet (one head per target ResNet block): trained in full.
-- Deep ResNet blocks (down_blocks[-1], mid_block.resnets, up_blocks[0]):
-    conv1 and conv2 wrapped with LoRAConv2d (rank --lora_rank, default 4).
-    Also trains: time_emb_proj, norm1, norm2 (small layers; ~57M total vs ~251M without LoRA).
-    Attention layers in mid_block remain frozen.
-- conv_in (9→13 ch expansion for densepose, same as base extension): trained in full.
-- VAE, text encoders, image encoder, GarmentNet, IP-Adapter / Resampler,
-  attention layers in deep blocks, all outer TryonNet blocks: frozen.
-- Text encoders stay on CPU; moved to GPU only for the brief encoding window per step.
-
-FiLM hooks are registered via PyTorch forward hooks on each target resnet.norm2 module.
-A shared _FiLMContext object passes the current batch's measurement embedding into the
-hooks without changing the UNet's public API.  IMPORTANT: film_ctx.embedding must remain
-set throughout accelerator.backward() because gradient checkpointing recomputes the
-forward pass during the backward; clearing it before backward would give wrong gradients.
-
-Checkpoint layout per saved epoch:
-  checkpoint-<step>/
-    unet_lora.pt           ← trainable UNet params only (LoRA A/B + norms + time_emb_proj + conv_in)
-    film_generators.pt     ← FiLMGeneratorSet state dict
-    measurement_encoder.pt ← MeasurementEncoder state dict
-    optimizer.pt
-    lr_scheduler.pt
 """
 
 import os
@@ -71,9 +35,7 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.training_utils import compute_snr
 
 
-# ---------------------------------------------------------------------------
-# FiLM hook infrastructure
-# ---------------------------------------------------------------------------
+
 
 class _FiLMContext:
     """Mutable context object shared between the training loop and FiLM hooks.
@@ -88,12 +50,7 @@ class _FiLMContext:
 class LoRAConv2d(torch.nn.Module):
     """Frozen Conv2d with a trainable low-rank bypass ΔW = B·A.
 
-    Approximates the full weight update with two small convolutions:
-      lora_A: (C_in → rank, 1×1) down-projects the spatial feature map
-      lora_B: (rank → C_out, k×k) up-projects back to the original spatial size
-
-    lora_B is zero-initialized so ΔW = 0 at the start of training, preserving
-    the pretrained baseline exactly.
+    Approximates the full weight update with two small convolutions
     """
 
     def __init__(self, conv: torch.nn.Conv2d, rank: int = 4) -> None:
@@ -138,13 +95,6 @@ def _get_target_resnets(unet) -> list:
 def _register_film_hooks(unet, film_generators: FiLMGeneratorSet, ctx: _FiLMContext) -> list:
     """Register output hooks on norm2 of each target ResNet block.
 
-    The hook fires right after GroupNorm (norm2) computes its output and before
-    the SiLU nonlinearity, applying:
-        FiLM(h | m) = γ(m) * h + β(m)
-
-    During classifier-free guidance the UNet receives a doubled batch
-    [uncond; cond]; the embedding is repeated to match automatically.
-
     Returns a list of hook handles — call handle.remove() to deregister.
     """
     target_resnets = _get_target_resnets(unet)
@@ -175,9 +125,6 @@ def _register_film_hooks(unet, film_generators: FiLMGeneratorSet, ctx: _FiLMCont
     return hooks
 
 
-# ---------------------------------------------------------------------------
-# Utilities (identical to train_with_measurements.py)
-# ---------------------------------------------------------------------------
 
 def _setup_cloud_logging(log_name: str = "idm-vton-film-training") -> py_logging.Logger:
     logger = py_logging.getLogger(log_name)
@@ -313,9 +260,7 @@ def _compute_fit_loss(
     return iou_loss + boundary_weight * b_loss
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+
 
 def parse_args():
     import argparse
@@ -385,9 +330,7 @@ def parse_args():
     return args
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+
 
 def main():
     args = parse_args()
@@ -508,10 +451,6 @@ def main():
     film_generators    = FiLMGeneratorSet(input_dim=cross_attn_dim, channel_dims=film_channel_dims)
 
     # ── LoRA wrapping ─────────────────────────────────────────────────────────
-    # Wrap conv1/conv2 (and conv_shortcut when present) in the target ResNet blocks
-    # with low-rank adapters.  This reduces ResNet trainable params from ~206M to ~1.4M
-    # (rank 4), saving ~2 GB of optimizer state.  lora_B is zero-init so the pretrained
-    # baseline is preserved at step 0.
     if args.lora_rank > 0:
         _apply_lora_to_resnets(_get_target_resnets(unet), rank=args.lora_rank)
 
@@ -529,8 +468,6 @@ def main():
         weight_dtype = torch.bfloat16
 
     vae.to(accelerator.device)
-    # Keep text encoders on CPU — they are ~2.3 GB and only needed briefly per step.
-    # They are moved to GPU in the training loop just before encoding, then back to CPU.
     text_encoder.to(dtype=weight_dtype)
     text_encoder_2.to(dtype=weight_dtype)
     image_encoder.to(accelerator.device,  dtype=weight_dtype)
@@ -748,9 +685,6 @@ def main():
         text_encoder_2.to(accelerator.device)
 
         with torch.no_grad(), torch.cuda.amp.autocast():
-            # Build a TryonPipeline around the current (unwrapped) UNet.
-            # The FiLM hooks are already registered on unet_unwrapped.down_blocks[-1] etc.,
-            # so setting film_ctx.embedding before the pipeline call is sufficient.
             newpipe = TryonPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=unet_unwrapped,
@@ -770,11 +704,8 @@ def main():
 
             for sample in test_dataloader:
                 meas = sample["measurements"].to(accelerator.device, dtype=torch.float32)
-                # Compute embedding [B, 2048] — no dropout during validation
                 meas_emb = menc_unwrapped(meas, measurement_dropout_prob=0.0).squeeze(1)
                 # Set context so FiLM hooks activate during inference denoising steps.
-                # During CFG the UNet receives 2B inputs; the hook handles batch-size
-                # mismatch automatically.
                 film_ctx.embedding = meas_emb.to(dtype=torch.float32)
 
                 img_emb_list = [sample["garment_image_clip"][i] for i in range(sample["garment_image_clip"].shape[0])]
@@ -928,7 +859,7 @@ def main():
                 text_embeds        = enc1.hidden_states[-2]   # [B, 77, 768]
                 pooled_text_embeds = enc2[0]                  # [B, 1280]
                 text_embeds_2      = enc2.hidden_states[-2]   # [B, 77, 1280]
-                # Cross-attention context: [B, 77, 2048] — no measurement token appended;
+                # Cross-attention context: [B, 77, 2048], no measurement token appended;
                 # measurements are injected via FiLM instead.
                 encoder_hidden_states = torch.cat([text_embeds, text_embeds_2], dim=-1)
 
@@ -937,11 +868,7 @@ def main():
                 measurement_emb = accelerator.unwrap_model(measurement_encoder)(
                     measurements, measurement_dropout_prob=args.measurement_dropout
                 ).squeeze(1)  # [B, 2048]
-                # Keep in float32 for numerical stability; hook casts to feature dtype
                 film_ctx.embedding = measurement_emb.to(dtype=torch.float32)
-                # NOTE: do NOT clear film_ctx.embedding here — it must remain set through
-                # accelerator.backward() because gradient checkpointing recomputes the
-                # forward pass during the backward.
 
                 # ── SDXL time/size conditioning ───────────────────────────────
                 def compute_time_ids(original_size, crops_coords_top_left=(0, 0)):

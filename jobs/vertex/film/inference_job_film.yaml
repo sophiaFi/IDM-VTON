@@ -1,14 +1,4 @@
 # Vertex AI CustomJob spec for inference_film.py.
-#
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-film-inference \
-#       --config=inference_job_film.yaml
-#
-# Results are uploaded to gs://idm-vton-bucket/film_run_1/inference_output/.
-#
-# Set CHECKPOINT_PREFIX below to point at the checkpoint step to evaluate.
 
 workerPoolSpecs:
   - machineSpec:

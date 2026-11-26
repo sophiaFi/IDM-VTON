@@ -1,18 +1,5 @@
 """
 Hyperparameter optimisation for IDM-VTON + MeasurementEncoder.
-
-Usage (called from vertex_hpo_job.yaml):
-  python train_hpo.py \
-      --data_dir /tmp/data_hpo \
-      --pretrained_model_name_or_path /tmp/yisol-IDM-VTON \
-      --pretrained_ip_adapter_path /tmp/ckpt/ip_adapter/ip-adapter-plus_sdxl_vit-h.bin \
-      --output_dir /tmp/hpo_output \
-      --n_trials 30 \
-      --max_proxy_steps 1000 \
-      --mixed_precision bf16 \
-      --gradient_checkpointing \
-      --gcs_study_bucket ma-idm-vton-data \
-      --gcs_study_prefix hpo/study.db
 """
 
 import argparse

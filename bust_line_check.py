@@ -1,8 +1,4 @@
 """Draw the assumed bust line on the person images in data/empirical for manual checking.
-
-Mirrors get_mask_location in gradio_demo/utils_mask.py: bust points lie at
-`bust_fraction` along each shoulder->hip line, and the bust line is the
-horizontal line at the mean y of the two bust points.
 """
 import argparse
 from pathlib import Path

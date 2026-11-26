@@ -1,41 +1,5 @@
 """
 inference_film.py — Run IDM-VTON + FiLM inference on FIT dataset samples.
-
-Two modes:
-
-  Without --checkpoint_dir (default):
-    Loads yisol/IDM-VTON pretrained weights and runs inference on FIT data.
-    Measurements are read but not injected (the pretrained model has no
-    FiLM conditioning). Use this to verify the data pipeline and get a
-    baseline before any fine-tuning.
-
-  With --checkpoint_dir <path>:
-    Loads the base model specified by --pretrained_model_name_or_path (must be
-    the SAME base used during training, default yisol/IDM-VTON), then overlays
-    LoRA conv weights + conv_in + MeasurementEncoder + FiLMGeneratorSet from
-    the checkpoint. Measurements are injected via FiLM modulation
-    (element-wise γ/β scaling applied after norm2 in each target ResNet block),
-    NOT by appending tokens to the cross-attention sequence.
-
-    Checkpoint layout expected:
-      checkpoint-<step>/
-        unet_lora.pt           ← trainable UNet params (LoRA A/B + norms + conv_in)
-        film_generators.pt     ← FiLMGeneratorSet state dict
-        measurement_encoder.pt ← MeasurementEncoder state dict
-
-    IMPORTANT: --pretrained_model_name_or_path must match the training base model.
-    Training uses yisol/IDM-VTON (13-channel UNet). Using a different base will
-    corrupt outputs because LoRA deltas are additive offsets on the training base.
-
-Example (quick single-sample test, no checkpoint):
-    python inference_film.py --data_dir data/data_mini_test --num_samples 1
-
-Example (after training):
-    python inference_film.py \\
-        --data_dir data/data_mini_test \\
-        --checkpoint_dir output/checkpoint-500 \\
-        --output_dir result_film \\
-        --num_samples 4
 """
 
 import argparse
@@ -61,7 +25,6 @@ from transformers import (
     CLIPVisionModelWithProjection,
 )
 
-# Preprocessing models live inside gradio_demo/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "gradio_demo"))
 
 from ip_adapter.ip_adapter import Resampler
@@ -122,9 +85,6 @@ def _compute_garment_composite_mask(
     return mask
 
 
-# ---------------------------------------------------------------------------
-# FiLM hook infrastructure (mirrors train_with_film.py)
-# ---------------------------------------------------------------------------
 
 class _FiLMContext:
     embedding: Optional[torch.Tensor] = None
@@ -192,9 +152,6 @@ def _register_film_hooks(unet, film_generators: FiLMGeneratorSet, ctx: _FiLMCont
     return hooks
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _build_densepose_predictor(device: str, model_path: str):
     import apply_net
@@ -239,9 +196,6 @@ def _pad_to_multiple(t: torch.Tensor, multiple: int = 8):
     return torch.nn.functional.pad(t, (0, pad_w, 0, pad_h), mode="reflect"), (pad_h, pad_w)
 
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(description="IDM-VTON FiLM inference on FIT dataset.")
@@ -310,9 +264,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -681,7 +632,6 @@ def main():
                 feather_radius=15,
             )
 
-            # Alpha-blend: generated where mask=255, original where mask=0.
             result_composed = Image.composite(result_resized, orig_crop, composite_mask)
             orig_person.paste(result_composed, (left, top))
             orig_person.save(out_path)

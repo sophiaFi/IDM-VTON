@@ -1,19 +1,4 @@
 # Vertex AI CustomJob spec for Measurement Adapter (Ext 3) HPO, round 2.
-#
-# Round 1 top-1 values for gate_lr_multiplier, scale_mode, use_fourier, fourier_scale and
-# measurement_dropout are fixed below (--fixed_*). Round 2 searches lr, num_measurement_tokens,
-# measurement_token_dim and lr_scheduler, at a higher resolution than round 1.
-#
-# Submit with:
-#   gcloud ai custom-jobs create --region=us-central1 --display-name=idm-vton-adapter-hpo-round2a --config=vertex_hpo_job_adapter_round2.yaml
-#
-# After completion, retrieve results with:
-#   gsutil cp gs://idm-vton-ma/adapter_hpo_round2/top3_configs.json .
-#   gsutil cp gs://idm-vton-ma/adapter_hpo_round2/all_trials.csv .
-#
-# The Optuna SQLite study is persisted after every trial to
-# gs://idm-vton-ma/adapter_hpo_round2/study.db
-# If the job is preempted, resubmit this YAML and the study resumes automatically.
 
 workerPoolSpecs:
   - machineSpec:

@@ -1,21 +1,4 @@
 # Vertex AI CustomJob spec for inference_measurement_adapter.py (Extension 3).
-#
-# Usage:
-#   gcloud ai custom-jobs create \
-#       --region=europe-west4 \
-#       --display-name=idm-vton-adapter-inference \
-#       --config=inference_job_adapter.yaml
-#
-# Prerequisites:
-#   - Upload inference_measurement_adapter.py to gs://idm-vton-ma/scripts/
-#     (it is not baked into the image; src/fit_dataset.py and src/measurement_adapter.py are).
-#   - The test data prefix below must contain person/, cloth/ and measurements.json.
-#
-# Results are uploaded to gs://idm-vton-ma/adapter_run_mini/inference_output/.
-#
-# Set CHECKPOINT_PREFIX below to the checkpoint to evaluate. If left empty, the
-# latest checkpoint under CHECKPOINT_ROOT is used.
-# Set MEASUREMENT_SCALE to 0.0 to turn the measurement branch off (sensitivity analysis).
 
 workerPoolSpecs:
   - machineSpec:
